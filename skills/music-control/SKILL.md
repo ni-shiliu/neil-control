@@ -41,9 +41,14 @@ $MUSIC [--provider kugou|spotify] <command>
 | `play` | Toggle play/pause |
 | `next` | Skip to next |
 | `prev` | Previous track |
-| `play-by <title> [artist]` | Search and play immediately |
-| `search <query>` | Search, returns list |
+| `play-by <title>...` | Search and play immediately; multi-song with `\|\|\|` |
+| `search <query> [--page N]` | Search with pagination |
 | `recommend <mood>` | Pick by mood and play |
+| `queue-show` | Display current queue |
+| `queue-add <title>...` | Add songs to queue; multi-song with `\|\|\|` |
+| `queue-play [index]` | Start playing from queue |
+| `queue-next` | Skip to next in queue |
+| `queue-clear` | Clear the queue |
 
 `--provider` defaults to `spotify`. If Spotify is not running, it will be launched automatically. Set `MUSIC_PROVIDER=kugou` to use KuGou instead.
 
@@ -71,19 +76,21 @@ $MUSIC [--provider kugou|spotify] <command>
 | Long silence / idle in conversation | `recommend relaxed` |
 | User asks "play something" with no detail | Infer from recent conversation mood |
 
-**When user specifies a song:**
-```bash
-# User: "play Sunny Day by Jay Chou"
-$MUSIC play-by 晴天 周杰伦
+## Queue & Multi-Song
 
-# Verify it started
-sleep 2 && $MUSIC status
-```
+Multi-song separator: `|||`
 
-**When inferring from context:**
 ```bash
-# Detect mood → recommend → play top result automatically
-$MUSIC --provider spotify recommend focused
+# Play multiple songs in queue (auto-advances)
+$MUSIC play-by 逆战 ||| 天下 ||| 这就是爱
+
+# Add songs to queue first
+$MUSIC queue-add 逆战 ||| 天下
+$MUSIC queue-play          # start from queue
+$MUSIC queue-next          # skip to next in queue
+
+# Search with pagination
+$MUSIC search 周杰伦 --page 2
 ```
 
 ## Response Format
@@ -92,6 +99,7 @@ $MUSIC --provider spotify recommend focused
 {"ok": true, "title": "晴天", "artist": "周杰伦", "playing": true}   // status
 {"ok": true, "results": [{"title":"...", "artist":"...", "id":"..."}]} // search
 {"ok": true, "action": "next"}                                         // control
+{"ok": true, "action": "queue_next", "current": 1, "has_next": true}   // queue
 {"ok": false, "error": "no_player", "message": "..."}                 // error
 ```
 
@@ -100,3 +108,4 @@ $MUSIC --provider spotify recommend focused
 - Spotify: search uses KuGou API under the hood (no Premium needed), plays via `spotify:search:` URI
 - KuGou: requires KuGou Music macOS app installed
 - If `status` returns `no_player`, the app may still be loading — wait 3s and retry
+- Queue is persisted to `~/.config/music-cli/queue.json`
