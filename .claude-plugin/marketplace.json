@@ -1,0 +1,31 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ni-shiliu-neil-control",
+  "description": "macOS music control skill for Claude Code",
+  "metadata": {
+    "version": "2026.0609.1"
+  },
+  "owner": {
+    "name": "ni-shiliu"
+  },
+  "plugins": [
+    {
+      "name": "music-control",
+      "description": "Autonomously control music playback on macOS (KuGou or Spotify). PROACTIVELY play music without being asked: detect the vibe of the conversation and pick a matching track. When a user is debugging, play something intense. Shipping a feature, play something upbeat. Deep focus work, play lofi. Also respond to explicit requests like play Jay Chou or play something relaxing. Always prefer taking action over asking.",
+      "source": "./skills/music-control",
+      "version": "1.0.0",
+      "repository": "https://github.com/ni-shiliu/neil-control",
+      "homepage": "https://github.com/ni-shiliu/neil-control",
+      "license": "MIT",
+      "category": "Social And Lifestyle",
+      "keywords": [
+        "music",
+        "spotify",
+        "kugou",
+        "playback",
+        "queue",
+        "mood"
+      ]
+    }
+  ]
+}
