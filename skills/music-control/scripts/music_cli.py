@@ -16,6 +16,7 @@ from providers import (
     MR_CMD_PLAY, MR_CMD_PAUSE, MR_CMD_TOGGLE, MR_CMD_NEXT, MR_CMD_PREV,
 )
 
+
 MOOD_MAP = {
     "focused": ["lofi hip hop", "深夜coding专注", "专注背景音乐"],
     "relaxed": ["轻音乐放松", "咖啡馆背景音乐", "ambient chill"],
@@ -266,13 +267,6 @@ def cmd_play_by(args):
     return 0 if ok else 1
 
 
-def cmd_auth(args):
-    if args.provider_obj.name != "spotify":
-        err("auth 命令仅支持 --provider spotify", "unsupported")
-        return 1
-    return 0 if args.provider_obj.auth_login() else 1
-
-
 # ── 队列命令 ──────────────────────────────────────────────────────────────────
 def cmd_queue_show(args):
     q = _load_queue()
@@ -412,7 +406,6 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("auth",   help="Spotify 授权登录（仅 --provider spotify）")
     sub.add_parser("status", help="当前播放信息")
     sub.add_parser("next",   help="下一首 / 队列下一首")
     sub.add_parser("prev",   help="上一首")
@@ -449,7 +442,6 @@ def main():
     args.provider_obj = get_provider(args.provider)
 
     fn = {
-        "auth":        cmd_auth,
         "status":      cmd_status,
         "next":        cmd_next,
         "prev":        cmd_prev,
