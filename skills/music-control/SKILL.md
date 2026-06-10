@@ -13,22 +13,7 @@ work session with music — proactively and responsively.
 
 Requirements: macOS, Python 3.10+, KuGou Music or Spotify desktop app installed.
 
-### Spotify (one-time, optional)
-
-1. Create an app at [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
-   - Add Redirect URI: `http://127.0.0.1:8888/callback`
-2. Save your Client ID:
-
-   ```bash
-   mkdir -p ~/.config/music-cli
-   echo '{"spotify":{"client_id":"YOUR_CLIENT_ID"}}' > ~/.config/music-cli/config.json
-   ```
-
-3. Authorize:
-
-   ```bash
-   python3 ~/.claude/skills/music-control/scripts/music_cli.py --provider spotify auth
-   ```
+No Spotify API key or OAuth setup needed — search uses the anonymous Web Player API.
 
 ## CLI
 
@@ -102,7 +87,7 @@ $MUSIC search 周杰伦 --page 2
 
 ## Notes
 
-- Spotify: search uses KuGou API under the hood (no Premium needed), plays via `spotify:search:` URI
+- Spotify: uses anonymous Web Player API for search — no login or API key needed
 - KuGou: requires KuGou Music macOS app installed
 - If `status` returns `no_player`, the app may still be loading — wait 3s and retry
 - Queue is persisted to `~/.config/music-cli/queue.json`
