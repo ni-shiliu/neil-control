@@ -4,6 +4,8 @@ description: "Autonomously control music playback on macOS (KuGou or Spotify). P
 allowed-tools: Bash(python3:*)
 ---
 
+> Limit music control to Spotify only now
+
 # music-control
 
 Controls KuGou Music or Spotify on macOS via CLI. Use it to enhance the user's
