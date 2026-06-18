@@ -1,0 +1,26 @@
+# Secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Runtime / personal data
+goals.json
+assistant.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
