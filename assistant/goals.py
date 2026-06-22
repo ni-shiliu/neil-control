@@ -26,7 +26,10 @@ def save(goals: list[dict]) -> None:
     )
 
 
-def add(raw: str, schedule: str, loop: str) -> dict:
+def add(raw: str, schedule: str | None, loop: str,
+        trigger_mode: str = "cron",
+        goal_condition: str | None = None,
+        retry_after_minutes: int = 30) -> dict:
     goals = load()
     goal = {
         "id": f"goal_{uuid.uuid4().hex[:6]}",
@@ -37,6 +40,11 @@ def add(raw: str, schedule: str, loop: str) -> dict:
         "created_at": _now(),
         "last_run": None,
         "last_result": None,
+        # Loop Engineering 扩展字段
+        "trigger_mode": trigger_mode,           # cron | goal | event
+        "goal_condition": goal_condition,        # goal 模式：达成条件描述
+        "retry_after_minutes": retry_after_minutes,  # goal 模式：重试间隔
+        "last_run_meta": {},                     # 结构化的上次执行结果
     }
     goals.append(goal)
     save(goals)
@@ -78,11 +86,13 @@ def resume(goal_id: str) -> bool:
     return _set_status(goal_id, "active")
 
 
-def update_last_run(goal_id: str, result: str) -> None:
+def update_last_run(goal_id: str, result: str, meta: dict | None = None) -> None:
     goals = load()
     for g in goals:
         if g["id"] == goal_id:
             g["last_run"] = _now()
             g["last_result"] = result
+            if meta is not None:
+                g["last_run_meta"] = meta
             save(goals)
             return

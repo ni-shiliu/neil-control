@@ -72,11 +72,15 @@ class TelegramBot:
         })
 
     def send_document(self, file_path: str, caption: str = "") -> None:
+        # 一次性读入内存，避免重试时文件已被删除
+        import os
+        filename = os.path.basename(file_path)
         with open(file_path, "rb") as f:
-            self._post("sendDocument", data={
-                "chat_id": self.chat_id,
-                "caption": caption,
-            }, files={"document": f})
+            file_bytes = f.read()
+        self._post("sendDocument", data={
+            "chat_id": self.chat_id,
+            "caption": caption,
+        }, files={"document": (filename, file_bytes, "application/octet-stream")})
 
 
 # 模块级默认实例，兼容旧调用

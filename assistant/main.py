@@ -45,15 +45,22 @@ def _parse_goal(user_input: str) -> dict | None:
     loop_lines = "\n".join(f"- {n}：{l.description}" for n, l in loops.items())
     prompt = f"""用户说："{user_input}"
 
-请判断这是否是一个需要定时执行的任务目标，并解析成结构化数据。
+请判断这是否是一个需要执行的任务目标，并解析成结构化数据。
 
 支持的 loop 类型（从下列中选最匹配的一个，或判断为非任务目标）：
 {loop_lines}
 
+触发模式说明：
+- cron  : 固定时间触发，需要 schedule（如"每天早上8点"）
+- goal  : 目标驱动，持续运行直到目标达成（如"保持收件箱零未读"），可搭配初始 schedule
+- event : 事件驱动，实时响应（如"有新邮件时立刻处理"），不需要 schedule
+
 如果是任务目标，输出 JSON：
 {{
   "is_goal": true,
-  "schedule": "5字段cron表达式（分 时 日 月 周），时区Asia/Shanghai。例：每天10点='0 10 * * *'，每周一8点半='30 8 * * 1'。注意只有5段，不要加秒字段",
+  "trigger_mode": "cron 或 goal 或 event",
+  "schedule": "5字段cron（仅 cron/goal 模式需要，event 填 null）。例：每天10点='0 10 * * *'",
+  "goal_condition": "goal 模式时填达成条件描述，其他填 null",
   "loop": "loop类型",
   "summary": "一句话描述这个目标"
 }}
@@ -173,13 +180,18 @@ def _handle_input(user_input: str) -> None:
             print(f"暂不支持的 loop 类型：{loop}，当前支持：{', '.join(discover())}")
             return
 
+        trigger_mode = result.get("trigger_mode", "cron")
         goal = goals_mod.add(
             raw=user_input,
-            schedule=result["schedule"],
+            schedule=result.get("schedule"),
             loop=loop,
+            trigger_mode=trigger_mode,
+            goal_condition=result.get("goal_condition"),
         )
         scheduler.add_goal(goal)
+        mode_label = {"cron": "定时", "goal": "目标驱动", "event": "事件驱动"}.get(trigger_mode, trigger_mode)
         print(f"✓ 已添加目标 {goal['id']}：{result['summary']}")
+        print(f"  触发模式: {mode_label} | Loop: {goal['loop']}")
         print(f"  调度: {goal['schedule']} | Loop: {goal['loop']}")
 
 

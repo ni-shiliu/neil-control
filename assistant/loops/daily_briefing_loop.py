@@ -38,6 +38,15 @@ class DailyBriefingLoop(BaseLoop):
 
     name = "daily_briefing_loop"
     description = "每日简报：抓取天气+头条+GitHub+HN+36kr，Claude 生成动态 HTML 简报，Telegram 发送"
+    required_tools = ["claude", "telegram"]
+
+    def extract_memory(self, result: dict, old_memory: dict) -> dict:
+        from datetime import datetime
+        return {
+            **old_memory,
+            "last_sent": datetime.now().isoformat(),
+            "last_today": result.get("today", ""),
+        }
 
     def _call_claude(self, prompt: str, max_tokens: int = 4096) -> str:
         msg = get_client().messages.create(
@@ -178,7 +187,7 @@ class DailyBriefingLoop(BaseLoop):
 
     # ── BaseLoop 实现 ────────────────────────────────────
 
-    def plan(self, goal: dict) -> dict:
+    def plan(self, goal: dict, ctx=None) -> dict:
         log.info("并发抓取数据源...")
         today = datetime.now().strftime("%Y年%m月%d日 %A")
 
@@ -237,7 +246,7 @@ class DailyBriefingLoop(BaseLoop):
                 return item["url"]
         return ""
 
-    def execute(self, context: dict) -> dict:
+    def execute(self, context: dict, ctx=None) -> dict:
         today = context["today"]
         weather = context["weather"]
         toutiao = context["toutiao"]
@@ -324,7 +333,7 @@ HTML 末尾留一个注释占位：<!-- ENGLISH_BLOCK -->
             return False, "HTML 内容过短，需要重新生成"
         return True, ""
 
-    def fix(self, result: dict, issues: str) -> dict:
+    def fix(self, result: dict, issues: str, ctx=None) -> dict:
         log.info(f"HTML 验证不通过（{issues}），重新生成...")
         prompt = f"""上次生成的简报问题：{issues}
 

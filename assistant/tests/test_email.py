@@ -48,48 +48,36 @@ def main() -> None:
     loop = EmailLoop(agent_mode=mode, max_emails=args.max)
     goal = {"id": "test_email_001", "raw": "测试邮件处理"}
 
-    print(">>> plan 阶段：拉取未读邮件...")
-    context = loop.plan(goal)
-    emails = context.get("emails", [])
-    print(f"  拉到 {len(emails)} 封")
-    for i, em in enumerate(emails, 1):
-        print(f"  [{i}] uid={em['uid']} from={em['sender']} subject={em['subject']!r}")
-        snippet = em['body'][:60].replace('\n', ' ')
-        print(f"      body: {snippet}...")
+    print(">>> 通过 LoopEngine 运行（记忆 + 工具注入）...")
+    from engine.engine import LoopEngine
+    from engine.memory import MemoryStore
 
-    if not emails:
-        print("\n收件箱没有未读邮件，先发一封再来跑测试。")
-        return
+    memory_store = MemoryStore()
+    engine = LoopEngine(memory_store=memory_store)
+    run_result = engine.run(loop, goal)
 
-    print(f"\n>>> execute 阶段：Claude 生成回复 + Maker-Checker 验证...")
-    result = loop.execute(context)
-
+    result = run_result.result
     print(f"\n=== 执行结果 ===")
-    print(f"已发送: {len(result['sent'])}")
-    for s in result["sent"]:
+    print(f"已发送: {len(result.get('sent', []))}")
+    for s in result.get("sent", []):
         print(f"  - {s['subject']}")
-    print(f"存草稿: {len(result['drafted'])}")
-    for d in result["drafted"]:
+    print(f"存草稿: {len(result.get('drafted', []))}")
+    for d in result.get("drafted", []):
         print(f"  - {d['subject']}  原因: {d.get('reason', '-')}")
     print(f"跳过:   {len(result.get('skipped', []))}")
     for s in result.get("skipped", []):
         print(f"  - {s['subject']}  原因: {s.get('reason', '-')}")
-    print(f"失败:   {len(result['failed'])}")
-    for f in result["failed"]:
+    print(f"失败:   {len(result.get('failed', []))}")
+    for f in result.get("failed", []):
         print(f"  - {f['subject']}  错误: {f.get('error', '-')}")
 
-    print(f"\n>>> verify 阶段...")
-    ok, issues = loop.verify(result)
-    print(f"  ok={ok} issues={issues!r}")
+    print(f"\n>>> summary: {run_result.summary}")
 
-    if not ok:
-        print(f"\n>>> fix 阶段...")
-        fixed = loop.fix(result, issues)
-        print(f"  fix 后 failed={len(fixed.get('failed', []))} drafted={len(fixed.get('drafted', []))}")
-
-    print(f"\n>>> report 阶段...")
-    summary = loop.report(result)
-    print(f"  {summary}")
+    # 验证记忆是否写入
+    mem = memory_store.load(loop.name)
+    print(f"\n>>> memory/email_loop.json:")
+    import json
+    print(json.dumps(mem, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
