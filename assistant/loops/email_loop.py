@@ -32,8 +32,8 @@ SMTP_PORT = 465
 # Maker 和 Checker 必须看到同一段原文（关键承诺/金额不能被错位截断）
 BODY_LIMIT_FOR_CLAUDE = 2000
 
-# 自动发送的置信度阈值
-AUTO_SEND_CONFIDENCE = 75
+# 自动发送置信度阈值（可被 .env 中 EMAIL_AUTO_SEND_CONFIDENCE 覆盖）
+AUTO_SEND_CONFIDENCE = int(os.environ.get("EMAIL_AUTO_SEND_CONFIDENCE", 75))
 
 # 自动发件人白名单：命中后永远存草稿，不让 AI 决定是否回复
 # 匹配规则：完整邮箱 或 @后缀（如 @notice.aliyun.com 匹配所有 aliyun 通知）
@@ -173,14 +173,31 @@ class EmailLoop(BaseLoop):
         self._send(to, subject, reply_text)
         self._mark_read(uid)
 
+    @staticmethod
+    def _text_to_html(text: str) -> str:
+        """把纯文本（\\n\\n 分段）转成简单 HTML，保留段落结构。"""
+        import html as html_lib
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        lines = []
+        for p in paragraphs:
+            inner = html_lib.escape(p).replace("\n", "<br>")
+            lines.append(f"<p>{inner}</p>")
+        return (
+            '<html><body style="font-family:Arial,sans-serif;font-size:14px;'
+            'line-height:1.7;color:#333">'
+            + "".join(lines)
+            + "</body></html>"
+        )
+
     def _save_draft(self, to: str, subject: str, body: str) -> str:
         """把回复正文保存为完整 RFC822 邮件到草稿箱。"""
-        msg = MIMEMultipart()
+        msg = MIMEMultipart("alternative")
         msg["From"] = os.environ["EMAIL_USER"]
         msg["To"] = to
         msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
         msg["Date"] = email_lib.utils.formatdate(localtime=True)
         msg.attach(MIMEText(body, "plain", "utf-8"))
+        msg.attach(MIMEText(self._text_to_html(body), "html", "utf-8"))
         conn = self._imap()
         try:
             result = conn.append("Drafts", "\\Draft", None, msg.as_bytes())
@@ -198,12 +215,13 @@ class EmailLoop(BaseLoop):
 
     def _save_draft_and_mark_read(self, uid: str, to: str, subject: str, reply_text: str) -> str:
         """在同一个 IMAP session 内完成 append + flag，避免跨连接导致重复处理。"""
-        msg = MIMEMultipart()
+        msg = MIMEMultipart("alternative")
         msg["From"] = os.environ["EMAIL_USER"]
         msg["To"] = to
         msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
         msg["Date"] = email_lib.utils.formatdate(localtime=True)
         msg.attach(MIMEText(reply_text, "plain", "utf-8"))
+        msg.attach(MIMEText(self._text_to_html(reply_text), "html", "utf-8"))
         conn = self._imap()
         try:
             append_result = conn.append("Drafts", "\\Draft", None, msg.as_bytes())
@@ -220,6 +238,29 @@ class EmailLoop(BaseLoop):
             return self._full_auto_reply(sender, subject, body)
         return self._semi_auto_reply(sender, subject, body)
 
+    def _should_reply(self, sender: str, subject: str, body: str) -> dict:
+        """判断这封邮件是否需要回复。返回 {"need_reply": bool, "reason": str}"""
+        return self._call_claude(f"""你是邮件分类助手，判断一封邮件是否需要人工回复。
+
+发件人：{sender}
+主题：{subject}
+正文：{body[:BODY_LIMIT_FOR_CLAUDE]}
+
+以下情况【不需要回复】：
+- 系统自动通知（账单、到期提醒、安全告警、服务变更通知）
+- 营销/订阅/Newsletter（周刊、产品更新、推广邮件）
+- 退信通知（Delivery Status Notification、mailer-daemon）
+- 无需确认的单向通知（激活成功、支付成功、发货通知）
+- 发件人是 noreply/no-reply/do-not-reply 开头
+
+以下情况【需要回复】：
+- 真人发来的问询、请求、邀请
+- 需要确认的事项（会议、合作、审批）
+- 客诉或需要跟进的工单
+
+输出严格 JSON：
+{{"need_reply":true或false,"reason":"一句话说明原因","summary":"一句话概括邮件内容（不超过30字）"}}""")
+
     def _semi_auto_reply(self, sender: str, subject: str, body: str) -> dict:
         result = self._call_claude(f"""你是专业邮件助手，帮用户回复工作邮件。
 
@@ -227,12 +268,20 @@ class EmailLoop(BaseLoop):
 主题：{subject}
 正文：{body[:BODY_LIMIT_FOR_CLAUDE]}
 
-风险判断（high/low）：
-- high：涉及合同、承诺、金额、投诉，或你不确定
-- low：会议确认、日常询问、简单信息同步
+风险判断（high/low）——只看回复本身的风险，不看邮件内容：
+- low（可自动回复）：
+  · 会议/活动邀请的出席确认
+  · 日常问候、简单致谢
+  · 收件确认、已阅知悉类回复
+  · 约定好的信息同步（进度播报、状态更新）
+- high（需人工确认）：
+  · 涉及金额、合同、法律条款
+  · 做出具体承诺或答应对方某件事
+  · 投诉、纠纷、敏感话题
+  · 你不确定对方真实意图
 
 输出严格 JSON：
-{{"risk_level":"low或high","risk_reason":"high时说明，low时为空","confidence":0到100,"reply":"回复正文不超过200字"}}""")
+{{"risk_level":"low或high","risk_reason":"high时说明，low时为空","confidence":0到100,"reply":"回复正文不超过200字，段落之间用\\n\\n分隔"}}""")
         return result
 
     def _full_auto_reply(self, sender: str, subject: str, body: str) -> dict:
@@ -248,7 +297,7 @@ action 选项：
 - escalate：超出自动处理范围
 
 输出严格 JSON：
-{{"action":"reply_now或save_draft或escalate","reason":"原因","confidence":0到100,"reply":"回复正文"}}""")
+{{"action":"reply_now或save_draft或escalate","reason":"原因","confidence":0到100,"reply":"回复正文，段落之间用\\n\\n分隔"}}""")
         # 统一成 semi_auto 格式方便后续处理
         action = result.get("action", "save_draft")
         return {
@@ -298,18 +347,28 @@ action 选项：
             conn.logout()
 
     def execute(self, context: dict) -> dict:
-        sent, drafted, failed = [], [], []
+        sent, drafted, skipped, failed = [], [], [], []
 
         for em in context["emails"]:
             uid, sender, subject, body = em["uid"], em["sender"], em["subject"], em["body"]
             try:
-                # 白名单发件人：永远存草稿，不调 Claude
+                # 白名单发件人：直接跳过，标已读，不调 Claude
                 wl_reason = self._should_auto_draft(sender)
                 if wl_reason:
-                    log.info(f"白名单跳过 send: {sender} | {wl_reason}")
-                    placeholder = f"[自动草稿：{wl_reason}]\n主题：{subject}\n发件人：{sender}\n\n本邮件来自白名单命中，已跳过 Claude 生成。"
-                    self._save_draft_and_mark_read(uid, sender, subject, placeholder)
-                    drafted.append({"uid": uid, "subject": subject, "reason": wl_reason})
+                    log.info(f"白名单跳过: {sender} | {wl_reason}")
+                    self._mark_read(uid)
+                    skipped.append({"uid": uid, "subject": subject, "sender": sender,
+                                    "reason": wl_reason})
+                    continue
+
+                # Claude 判断是否需要回复
+                sr = self._should_reply(sender, subject, body)
+                if not sr.get("need_reply"):
+                    log.info(f"不需要回复: {subject} | {sr.get('reason')}")
+                    self._mark_read(uid)
+                    skipped.append({"uid": uid, "subject": subject, "sender": sender,
+                                    "reason": sr.get("reason", ""),
+                                    "summary": sr.get("summary", "")})
                     continue
 
                 gen = self._generate_reply(uid, sender, subject, body)
@@ -317,32 +376,30 @@ action 选项：
                 risk = gen.get("risk_level", "high")
                 confidence = gen.get("confidence", 0)
 
-                # Maker-Checker 验证
+                # Maker-Checker 验证：只修正回复内容，不改变 risk 评级
                 check = self._verify_reply(sender, subject, body, reply_text)
                 if not check.get("pass") and confidence >= AUTO_SEND_CONFIDENCE:
-                    # 验证不通过但置信度高，重新生成一次
                     gen2 = self._generate_reply(uid, sender, subject,
                                                 body + f"\n[上次回复问题：{check.get('issues')}]")
                     reply_text = gen2.get("reply", reply_text)
-                    risk = gen2.get("risk_level", risk)
 
-                if risk == "low" and confidence >= AUTO_SEND_CONFIDENCE:
-                    # 暂时禁用自动发送：白名单不全，误发风险高，统一存草稿
-                    # self._send_and_mark_read(uid, sender, subject, reply_text)
-                    # sent.append({"uid": uid, "subject": subject})
-                    self._save_draft_and_mark_read(uid, sender, subject, reply_text)
-                    drafted.append({"uid": uid, "subject": subject,
-                                    "reason": f"[已禁用自动发送] risk={risk} conf={confidence}"})
+                auto_send = os.environ.get("EMAIL_AUTO_SEND", "false").lower() == "true"
+                if auto_send and risk == "low" and confidence >= AUTO_SEND_CONFIDENCE:
+                    self._send_and_mark_read(uid, sender, subject, reply_text)
+                    sent.append({"uid": uid, "subject": subject, "sender": sender, "reply": reply_text})
                 else:
+                    reason = gen.get("risk_reason", "") or f"risk={risk} conf={confidence}"
+                    if not auto_send:
+                        reason = f"[自动发送已关闭] {reason}".strip()
                     self._save_draft_and_mark_read(uid, sender, subject, reply_text)
-                    drafted.append({"uid": uid, "subject": subject,
-                                    "reason": gen.get("risk_reason", "")})
+                    drafted.append({"uid": uid, "subject": subject, "sender": sender,
+                                    "reason": reason})
             except Exception as e:
                 log.error(f"处理邮件失败 uid={uid}: {e}")
                 failed.append({"uid": uid, "subject": em.get("subject", ""),
                                "sender": em.get("sender", ""), "error": str(e)})
 
-        return {"sent": sent, "drafted": drafted, "failed": failed}
+        return {"sent": sent, "drafted": drafted, "skipped": skipped, "failed": failed}
 
     def verify(self, result: dict) -> tuple[bool, str]:
         failed = result.get("failed", [])
@@ -367,7 +424,60 @@ action 选项：
         return result
 
     def report(self, result: dict) -> str:
-        s = len(result.get("sent", []))
-        d = len(result.get("drafted", []))
-        f = len(result.get("failed", []))
-        return f"邮件处理完成：{s} 封已回复，{d} 封存草稿，{f} 封失败"
+        from datetime import datetime
+        sent    = result.get("sent", [])
+        drafted = result.get("drafted", [])
+        skipped = result.get("skipped", [])
+        failed  = result.get("failed", [])
+        now     = datetime.now().strftime("%m-%d %H:%M")
+
+        lines = [f"📬 邮件处理报告  {now}", ""]
+        lines.append(f"✅ 已回复 {len(sent)} 封  |  📝 草稿 {len(drafted)} 封  |  ⏭ 跳过 {len(skipped)} 封  |  ❌ 失败 {len(failed)} 封")
+
+        if sent:
+            lines += ["", "━━━━━━━━━━━━━━━━━━", f"✅ 已自动回复 {len(sent)} 封", "━━━━━━━━━━━━━━━━━━"]
+            for i, em in enumerate(sent, 1):
+                lines.append(f"{i}. {em['subject']}")
+                lines.append(f"   👤 {em.get('sender', '')}")
+                reply = em.get("reply", "")
+                if reply:
+                    # 最多展示 3 行，避免消息过长
+                    reply_lines = [l for l in reply.splitlines() if l.strip()][:3]
+                    lines.append(f"   💬 {reply_lines[0]}")
+                    for rl in reply_lines[1:]:
+                        lines.append(f"      {rl}")
+
+        if drafted:
+            lines += ["", "━━━━━━━━━━━━━━━━━━", f"📝 存草稿 {len(drafted)} 封（待确认）", "━━━━━━━━━━━━━━━━━━"]
+            for i, em in enumerate(drafted, 1):
+                reason = em.get("reason", "")
+                lines.append(f"{i}. {em['subject']}")
+                lines.append(f"   👤 {em.get('sender', '')}")
+                if reason:
+                    lines.append(f"   💬 {reason}")
+
+        if skipped:
+            lines += ["", "━━━━━━━━━━━━━━━━━━", f"⏭ 无需回复 {len(skipped)} 封", "━━━━━━━━━━━━━━━━━━"]
+            for i, em in enumerate(skipped, 1):
+                lines.append(f"{i}. {em['subject']}")
+                lines.append(f"   👤 {em.get('sender', '')}")
+                content_summary = em.get("summary") or em.get("reason", "")
+                if content_summary:
+                    lines.append(f"   📄 {content_summary}")
+
+        if failed:
+            lines += ["", "━━━━━━━━━━━━━━━━━━", f"❌ 失败 {len(failed)} 封", "━━━━━━━━━━━━━━━━━━"]
+            for i, em in enumerate(failed, 1):
+                lines.append(f"{i}. {em['subject']}")
+                lines.append(f"   ⚠️ {em.get('error', '')}")
+
+        message = "\n".join(lines)
+        try:
+            import notifier
+            notifier.notify_telegram(message, parse_mode="HTML")
+        except Exception as e:
+            log.warning(f"Telegram 通知失败: {e}")
+
+        plain = f"邮件处理完成：{len(sent)} 封已回复，{len(drafted)} 封存草稿，{len(skipped)} 封跳过，{len(failed)} 封失败"
+        log.info(plain)
+        return plain
