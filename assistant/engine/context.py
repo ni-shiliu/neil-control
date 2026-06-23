@@ -7,13 +7,18 @@ Loop 通过 ctx.tools.imap / ctx.tools.claude 操作，不直接 import 工具�
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+import logging
 from typing import TYPE_CHECKING
+from engine.effects import EffectCollector
 
 if TYPE_CHECKING:
     from engine.tools.claude_tool import ClaudeTool
     from engine.tools.imap_tool import IMAPTool
     from engine.tools.smtp_tool import SMTPTool
     from engine.tools.telegram_tool import TelegramTool
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -31,16 +36,29 @@ class ToolRegistry:
         from engine.tools.smtp_tool import SMTPTool
         from engine.tools.telegram_tool import TelegramTool
 
+        def _safe_build(tool_name: str, factory):
+            try:
+                return factory()
+            except Exception as e:
+                log.warning(f"[tools] 初始化失败 tool={tool_name}: {e}")
+                return None
+
         return cls(
-            claude=ClaudeTool() if "claude" in required else None,
-            imap=IMAPTool() if "imap" in required else None,
-            smtp=SMTPTool() if "smtp" in required else None,
-            telegram=TelegramTool() if "telegram" in required else None,
+            claude=_safe_build("claude", ClaudeTool) if "claude" in required else None,
+            imap=_safe_build("imap", IMAPTool) if "imap" in required else None,
+            smtp=_safe_build("smtp", SMTPTool) if "smtp" in required else None,
+            telegram=_safe_build("telegram", TelegramTool) if "telegram" in required else None,
         )
 
 
 @dataclass
 class RunContext:
     goal: dict
+    run_id: str = ""
     memory: dict = field(default_factory=dict)
+    goal_memory: dict = field(default_factory=dict)
+    recent_runs: dict = field(default_factory=dict)
+    runtime_doc: str = ""
+    loop_doc: str = ""
     tools: ToolRegistry = field(default_factory=ToolRegistry)
+    effects: EffectCollector = field(default_factory=EffectCollector)

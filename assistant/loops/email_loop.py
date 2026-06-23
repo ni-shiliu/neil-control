@@ -2,9 +2,9 @@
 邮件 Loop。
 
 plan   → 从 IMAP 拉取未读邮件，历史 pattern 从记忆读取
-execute → 对每封邮件：白名单/should_reply → Maker-Checker → 发送或存草稿
+execute → 对每封邮件：白名单/should_reply → Maker-Checker → 产出 effect 意图
 verify  → 检查是否有处理失败的邮件
-fix    → 对失败邮件兜底存草稿
+fix    → 对失败邮件兜底生成草稿 effect
 report  → 格式化摘要字符串 + Telegram 通知
 
 Loop Engineering 扩展：
@@ -54,6 +54,8 @@ class EmailLoop(BaseLoop):
     name = "email_loop"
     description = "处理/回复邮件：拉取 163 邮箱未读邮件，Claude 分析生成回复，自动发送或存草稿"
     required_tools = ["imap", "smtp", "claude", "telegram"]
+    supported_trigger_modes = ("cron", "goal", "event")
+    use_loop_doc = True
 
     def __init__(self, agent_mode: str = "semi_auto", max_emails: int = 10,
                  auto_draft_senders: set[str] | None = None):
@@ -71,25 +73,79 @@ class EmailLoop(BaseLoop):
             return timedelta(minutes=30)
         return None  # 收件箱清空，等 IMAP IDLE 事件触发
 
+    @staticmethod
+    def _normalize_sender(sender: str) -> str:
+        return sender.lower().strip()
+
+    @staticmethod
+    def _is_own_sender(sender: str) -> bool:
+        email_user = os.environ.get("EMAIL_USER", "")
+        return bool(email_user) and EmailLoop._normalize_sender(sender) == email_user.lower().strip()
+
     def extract_memory(self, result: dict, old_memory: dict) -> dict:
-        """沉淀跳过的发件人 pattern，最多保留 200 条。"""
-        patterns = old_memory.get("skip_patterns", [])
-        seen = {p["sender"] for p in patterns}
-        for s in result.get("skipped", []):
-            if s["sender"] not in seen:
-                patterns.append({"sender": s["sender"], "reason": s.get("reason", "")})
-                seen.add(s["sender"])
+        """loop 级记忆只保留跨 goal 的轻量聚合统计。"""
+        totals = dict(old_memory.get("totals", {}))
+        totals["runs"] = int(totals.get("runs", 0)) + 1
+        totals["sent"] = int(totals.get("sent", 0)) + len(result.get("sent", []))
+        totals["drafted"] = int(totals.get("drafted", 0)) + len(result.get("drafted", []))
+        totals["skipped"] = int(totals.get("skipped", 0)) + len(result.get("skipped", []))
+        totals["failed"] = int(totals.get("failed", 0)) + len(result.get("failed", []))
         return {
             **old_memory,
-            "skip_patterns": patterns[-200:],
+            "totals": totals,
+        }
+
+    def extract_goal_memory(self, result: dict, old_memory: dict) -> dict:
+        """goal 级记忆沉淀该目标专属的跳过规则和近期处理状态。"""
+        patterns = [
+            p for p in old_memory.get("skip_patterns", [])
+            if not self._is_own_sender(p.get("sender", ""))
+        ]
+        seen = {self._normalize_sender(p["sender"]) for p in patterns if p.get("sender")}
+        for s in result.get("skipped", []):
+            sender = s.get("sender", "")
+            normalized = self._normalize_sender(sender)
+            if not sender or self._is_own_sender(sender) or normalized in seen:
+                continue
+            patterns.append({"sender": sender, "reason": s.get("reason", "")})
+            seen.add(normalized)
+        recent_activity = list(old_memory.get("recent_activity", []))
+        last_counts = {
             "unread_count": result.get("unread_count", 0),
+            "sent_count": len(result.get("sent", [])),
+            "drafted_count": len(result.get("drafted", [])),
+            "skipped_count": len(result.get("skipped", [])),
+            "failed_count": len(result.get("failed", [])),
+        }
+        recent_activity.append(last_counts)
+        recent_subjects = {
+            "sent": [item.get("subject", "") for item in result.get("sent", [])[:5] if item.get("subject")],
+            "drafted": [item.get("subject", "") for item in result.get("drafted", [])[:5] if item.get("subject")],
+            "skipped": [item.get("subject", "") for item in result.get("skipped", [])[:5] if item.get("subject")],
+            "failed": [item.get("subject", "") for item in result.get("failed", [])[:5] if item.get("subject")],
+        }
+        last_summary = (
+            f"sent={last_counts['sent_count']} "
+            f"drafted={last_counts['drafted_count']} "
+            f"skipped={last_counts['skipped_count']} "
+            f"failed={last_counts['failed_count']} "
+            f"unread={last_counts['unread_count']}"
+        )
+        return {
+            **old_memory,
+            "skip_patterns": patterns[-50:],
+            "unread_count": result.get("unread_count", 0),
+            "last_counts": last_counts,
+            "last_summary": last_summary,
+            "last_subjects": recent_subjects,
+            "recent_activity": recent_activity[-5:],
         }
 
     # ── 白名单：静态 + 记忆动态 pattern ─────────────────
 
     def _should_auto_skip(self, sender: str, memory: dict) -> str | None:
         """检查发件人是否应跳过。命中返回原因，否则 None。"""
-        s = sender.lower().strip()
+        s = self._normalize_sender(sender)
 
         # 1. 静态白名单
         for pattern in self._static_whitelist:
@@ -106,6 +162,10 @@ class EmailLoop(BaseLoop):
                 return f"历史记录：{pat.get('reason', '曾被跳过')}"
 
         return None
+
+    @staticmethod
+    def _effect_key(uid: str, action: str) -> str:
+        return f"email:{uid}:{action}"
 
     # ── Claude 调用（使用注入的 ClaudeTool）──────────────
 
@@ -224,7 +284,7 @@ action 选项：
     # ── BaseLoop 五个抽象方法 ─────────────────────────────
 
     def plan(self, goal: dict, ctx: "RunContext | None" = None) -> dict:
-        memory = ctx.memory if ctx else {}
+        memory = ctx.goal_memory if ctx else {}
         if ctx and ctx.tools.imap:
             emails = ctx.tools.imap.fetch_unseen(limit=self.max_emails)
         else:
@@ -237,8 +297,7 @@ action 选项：
         sent, drafted, skipped, failed = [], [], [], []
         memory = context.get("memory", {})
 
-        imap  = ctx.tools.imap  if ctx and ctx.tools.imap  else None
-        smtp  = ctx.tools.smtp  if ctx and ctx.tools.smtp  else None
+        effects = ctx.effects if ctx else None
 
         for em in context["emails"]:
             uid, sender, subject, body = em["uid"], em["sender"], em["subject"], em["body"]
@@ -247,21 +306,58 @@ action 选项：
                 skip_reason = self._should_auto_skip(sender, memory)
                 if skip_reason:
                     log.info(f"跳过: {sender} | {skip_reason}")
-                    if imap:
-                        imap.mark_read(uid)
-                    skipped.append({"uid": uid, "subject": subject, "sender": sender,
-                                    "reason": skip_reason})
+                    success_item = {
+                        "uid": uid,
+                        "subject": subject,
+                        "sender": sender,
+                        "reason": skip_reason,
+                    }
+                    failure_item = {
+                        "uid": uid,
+                        "subject": subject,
+                        "sender": sender,
+                        "reason": skip_reason,
+                    }
+                    if effects is not None:
+                        effects.add(
+                            "mark_read",
+                            {"uid": uid},
+                            {
+                                "success_bucket": "skipped",
+                                "success_item": success_item,
+                                "failure_item": failure_item,
+                            },
+                            idempotency_key=self._effect_key(uid, "skip_mark_read"),
+                        )
+                    else:
+                        skipped.append(success_item)
                     continue
 
                 # Claude 判断是否需要回复
                 sr = self._should_reply(sender, subject, body, ctx)
                 if not sr.get("need_reply"):
                     log.info(f"不需要回复: {subject} | {sr.get('reason')}")
-                    if imap:
-                        imap.mark_read(uid)
-                    skipped.append({"uid": uid, "subject": subject, "sender": sender,
-                                    "reason": sr.get("reason", ""),
-                                    "summary": sr.get("summary", "")})
+                    success_item = {
+                        "uid": uid,
+                        "subject": subject,
+                        "sender": sender,
+                        "reason": sr.get("reason", ""),
+                        "summary": sr.get("summary", ""),
+                    }
+                    failure_item = dict(success_item)
+                    if effects is not None:
+                        effects.add(
+                            "mark_read",
+                            {"uid": uid},
+                            {
+                                "success_bucket": "skipped",
+                                "success_item": success_item,
+                                "failure_item": failure_item,
+                            },
+                            idempotency_key=self._effect_key(uid, "no_reply_mark_read"),
+                        )
+                    else:
+                        skipped.append(success_item)
                     continue
 
                 # Maker：生成回复
@@ -279,35 +375,66 @@ action 选项：
 
                 auto_send = os.environ.get("EMAIL_AUTO_SEND", "false").lower() == "true"
                 if auto_send and risk == "low" and confidence >= AUTO_SEND_CONFIDENCE:
-                    if smtp:
-                        smtp.send(sender, subject, reply_text)
-                    if imap:
-                        imap.mark_read(uid)
-                    sent.append({"uid": uid, "subject": subject, "sender": sender,
-                                 "reply": reply_text})
+                    success_item = {
+                        "uid": uid,
+                        "subject": subject,
+                        "sender": sender,
+                        "reply": reply_text,
+                    }
+                    failure_item = {
+                        "uid": uid,
+                        "subject": subject,
+                        "sender": sender,
+                    }
+                    if effects is not None:
+                        effects.add(
+                            "send_email_and_mark_read",
+                            {"uid": uid, "to": sender, "subject": subject, "body": reply_text},
+                            {
+                                "success_bucket": "sent",
+                                "success_item": success_item,
+                                "failure_item": failure_item,
+                            },
+                            idempotency_key=self._effect_key(uid, "send_reply"),
+                        )
+                    else:
+                        sent.append(success_item)
                 else:
                     reason = gen.get("risk_reason", "") or f"risk={risk} conf={confidence}"
                     if not auto_send:
                         reason = f"[自动发送已关闭] {reason}".strip()
-                    if imap:
-                        imap.save_draft_and_mark_read(uid, sender, subject, reply_text)
-                    drafted.append({"uid": uid, "subject": subject, "sender": sender,
-                                    "reason": reason})
+                    success_item = {
+                        "uid": uid,
+                        "subject": subject,
+                        "sender": sender,
+                        "reason": reason,
+                    }
+                    failure_item = {
+                        "uid": uid,
+                        "subject": subject,
+                        "sender": sender,
+                        "reason": reason,
+                    }
+                    if effects is not None:
+                        effects.add(
+                            "save_draft_and_mark_read",
+                            {"uid": uid, "to": sender, "subject": subject, "body": reply_text},
+                            {
+                                "success_bucket": "drafted",
+                                "success_item": success_item,
+                                "failure_item": failure_item,
+                            },
+                            idempotency_key=self._effect_key(uid, "save_draft"),
+                        )
+                    else:
+                        drafted.append(success_item)
             except Exception as e:
                 log.error(f"处理邮件失败 uid={uid}: {e}")
                 failed.append({"uid": uid, "subject": em.get("subject", ""),
                                "sender": em.get("sender", ""), "error": str(e)})
 
-        # 统计剩余未读（用于 is_goal_met）
-        unread_count = 0
-        try:
-            if imap:
-                unread_count = imap.count_unseen()
-        except Exception:
-            pass
-
         return {"sent": sent, "drafted": drafted, "skipped": skipped, "failed": failed,
-                "unread_count": unread_count}
+                "unread_count": 0}
 
     def verify(self, result: dict) -> tuple[bool, str]:
         failed = result.get("failed", [])
@@ -317,19 +444,61 @@ action 选项：
         return False, f"以下邮件处理失败：{subjects}"
 
     def fix(self, result: dict, issues: str, ctx: "RunContext | None" = None) -> dict:
-        imap = ctx.tools.imap if ctx and ctx.tools.imap else None
+        effects = ctx.effects if ctx else None
+        repaired = []
+        still_failed = []
         for item in result.get("failed", []):
             try:
                 fallback = f"[自动回复失败，请人工处理]\n主题：{item['subject']}\n错误：{item['error']}"
-                if imap:
-                    imap.save_draft_and_mark_read(
-                        item["uid"], item.get("sender", ""), item["subject"], fallback
+                if effects is not None:
+                    effects.add(
+                        "save_draft_and_mark_read",
+                        {
+                            "uid": item["uid"],
+                            "to": item.get("sender", ""),
+                            "subject": item["subject"],
+                            "body": fallback,
+                        },
+                        {
+                            "success_bucket": "drafted",
+                            "success_item": {
+                                "uid": item["uid"],
+                                "subject": item["subject"],
+                                "sender": item.get("sender", ""),
+                                "reason": "处理失败，已存草稿",
+                            },
+                            "failure_item": {
+                                "uid": item["uid"],
+                                "subject": item["subject"],
+                                "sender": item.get("sender", ""),
+                                "reason": "兜底草稿失败",
+                            },
+                        },
+                        idempotency_key=self._effect_key(item["uid"], "fallback_draft"),
                     )
-                result["drafted"].append({"uid": item["uid"], "subject": item["subject"],
-                                          "reason": "处理失败，已存草稿"})
+                    repaired.append(item["uid"])
+                else:
+                    still_failed.append(item)
             except Exception as e:
                 log.error(f"兜底草稿失败: {e}")
-        result["failed"] = []
+                still_failed.append({
+                    "uid": item["uid"],
+                    "subject": item["subject"],
+                    "sender": item.get("sender", ""),
+                    "error": str(e),
+                })
+        result["failed"] = still_failed
+        if repaired:
+            log.info(f"已为失败邮件生成兜底草稿 effect: {len(repaired)} 封")
+        return result
+
+    def after_effects(self, result: dict, ctx: "RunContext | None" = None) -> dict:
+        if not ctx or not ctx.tools.imap:
+            return result
+        try:
+            result["unread_count"] = ctx.tools.imap.count_unseen()
+        except Exception as e:
+            log.warning(f"统计未读失败: {e}")
         return result
 
     def report(self, result: dict) -> str:
@@ -378,13 +547,19 @@ action 选项：
                 lines.append(f"{i}. {em['subject']}")
                 lines.append(f"   ⚠️ {em.get('error', '')}")
 
-        message = "\n".join(lines)
-        try:
-            import notifier
-            notifier.notify_telegram(message, parse_mode="HTML")
-        except Exception as e:
-            log.warning(f"Telegram 通知失败: {e}")
-
         plain = f"邮件处理完成：{len(sent)} 封已回复，{len(drafted)} 封存草稿，{len(skipped)} 封跳过，{len(failed)} 封失败"
+        result["notification_text"] = "\n".join(lines)
         log.info(plain)
         return plain
+
+    def build_notifications(
+        self,
+        result: dict,
+        summary: str,
+        ctx: "RunContext | None" = None,
+    ) -> list[dict]:
+        return [{
+            "channel": "telegram_message",
+            "text": result.get("notification_text", summary),
+            "parse_mode": "HTML",
+        }]

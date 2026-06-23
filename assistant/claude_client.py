@@ -16,7 +16,7 @@ def get_client() -> anthropic.Anthropic:
     if base_url:
         kwargs["base_url"] = base_url
     if auth_token:
-        kwargs["default_headers"] = {"x-auth-token": auth_token}
+        kwargs["default_headers"] = {"Authorization": f"Bearer {auth_token}"}
 
     return anthropic.Anthropic(**kwargs)
 

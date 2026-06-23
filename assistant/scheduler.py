@@ -16,36 +16,137 @@ from apscheduler.triggers.date import DateTrigger
 
 import goals as goals_mod
 import notifier
+from engine.records import RunRecorder
 from loops import discover
 
 log = logging.getLogger(__name__)
 
 _scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+_run_recorder = RunRecorder()
+_RUN_RECORDS_CLEANUP_JOB_ID = "__cleanup_run_records__"
+
+
+def _safe_increment_failure(goal_id: str) -> int:
+    try:
+        return goals_mod.increment_failure(goal_id)
+    except Exception as e:
+        log.error(f"goal={goal_id} 记录失败次数失败: {e}")
+        return 0
+
+
+def _safe_update_last_run(goal_id: str, summary: str, meta: dict | None = None) -> None:
+    try:
+        goals_mod.update_last_run(goal_id, summary, meta=meta)
+    except Exception as e:
+        log.error(f"goal={goal_id} 更新 last_run 失败: {e}")
+
+
+def _safe_mark_success(goal_id: str) -> None:
+    try:
+        goals_mod.mark_success(goal_id)
+    except Exception as e:
+        log.error(f"goal={goal_id} 标记成功失败: {e}")
+
+
+def _cleanup_run_records() -> None:
+    try:
+        deleted = _run_recorder.cleanup_old_files()
+        if deleted:
+            log.info(f"run_records 定时清理完成，删除 {deleted} 个历史文件")
+    except Exception as e:
+        log.error(f"run_records 定时清理失败: {e}")
+
+
+def _compute_failure_delay(goal: dict, failure_count: int) -> timedelta:
+    base_minutes = max(1, int(goal.get("retry_after_minutes", 30)))
+    factor = max(1, int(goal.get("retry_backoff_factor", 2)))
+    max_minutes = max(base_minutes, int(goal.get("retry_max_minutes", 240)))
+
+    delay_minutes = base_minutes * (factor ** max(0, failure_count - 1))
+    delay_minutes = min(delay_minutes, max_minutes)
+    return timedelta(minutes=delay_minutes)
+
+
+def _schedule_failure_retry(goal: dict, failure_count: int, reason: str) -> None:
+    max_retries = max(0, int(goal.get("max_retries", 3)))
+    if failure_count > max_retries:
+        log.error(f"goal={goal['id']} 已超过最大失败重试次数 {max_retries}，停止自动重试")
+        return
+
+    delay = _compute_failure_delay(goal, failure_count)
+    reschedule(goal["id"], delay)
+    log.warning(
+        f"goal={goal['id']} 执行失败，将在 {int(delay.total_seconds() // 60)} 分钟后重试 "
+        f"(failure_count={failure_count}/{max_retries}) | {reason}"
+    )
+
+
+def _execute_goal(
+    goal: dict,
+    *,
+    notify_result: bool = True,
+    allow_retry_schedule: bool = True,
+    dry_run_override: bool | None = None,
+):
+    goal_id = goal["id"]
+    effective_goal = dict(goal)
+    if dry_run_override is not None:
+        effective_goal["dry_run"] = dry_run_override
+
+    loop_name = goal.get("loop", "")
+    loop = discover().get(loop_name)
+    if not loop:
+        log.error(f"未知 loop 类型: {loop_name}")
+        return None
+
+    log.info(f"触发目标 {goal_id}: {goal['raw']} | dry_run={effective_goal.get('dry_run', False)}")
+    try:
+        from engine.engine import get_engine
+        engine = get_engine()
+        engine._scheduler = _scheduler_proxy()
+        run_result = engine.run(loop, effective_goal)
+        _safe_update_last_run(goal_id, run_result.summary, meta=run_result.result)
+        if run_result.success:
+            _safe_mark_success(goal_id)
+            if notify_result:
+                notifier.notify("助手完成任务", run_result.summary)
+            return run_result
+
+        failure_count = _safe_increment_failure(goal_id)
+        if notify_result:
+            notifier.notify("助手任务失败", run_result.summary)
+        if allow_retry_schedule and goal.get("status") == "active":
+            _schedule_failure_retry(goal, failure_count, run_result.summary)
+        return run_result
+    except Exception as e:
+        msg = f"执行失败: {e}"
+        log.error(f"goal={goal_id} {msg}")
+        failure_count = _safe_increment_failure(goal_id)
+        if notify_result:
+            notifier.notify("助手任务失败", msg)
+        if allow_retry_schedule and goal.get("status") == "active":
+            _schedule_failure_retry(goal, failure_count, msg)
+        return None
 
 
 def _run_goal(goal_id: str) -> None:
     goal = goals_mod.get(goal_id)
     if not goal or goal["status"] != "active":
         return
+    _execute_goal(goal, notify_result=True, allow_retry_schedule=True)
 
-    loop_name = goal.get("loop", "")
-    loop = discover().get(loop_name)
-    if not loop:
-        log.error(f"未知 loop 类型: {loop_name}")
-        return
 
-    log.info(f"触发目标 {goal_id}: {goal['raw']}")
-    try:
-        from engine.engine import get_engine
-        engine = get_engine()
-        engine._scheduler = _scheduler_proxy()
-        run_result = engine.run(loop, goal)
-        goals_mod.update_last_run(goal_id, run_result.summary, meta=run_result.result)
-        notifier.notify("助手完成任务", run_result.summary)
-    except Exception as e:
-        msg = f"执行失败: {e}"
-        log.error(f"goal={goal_id} {msg}")
-        notifier.notify("助手任务失败", msg)
+def run_goal_now(goal_id: str, *, dry_run_override: bool | None = None):
+    """手动立即执行某个 goal，不要求其当前处于 active。"""
+    goal = goals_mod.get(goal_id)
+    if not goal:
+        return None
+    return _execute_goal(
+        goal,
+        notify_result=True,
+        allow_retry_schedule=goal.get("status") == "active",
+        dry_run_override=dry_run_override,
+    )
 
 
 class _scheduler_proxy:
@@ -56,6 +157,13 @@ class _scheduler_proxy:
 
 def start() -> None:
     _scheduler.start()
+    _scheduler.add_job(
+        _cleanup_run_records,
+        trigger=CronTrigger(hour=3, minute=0, timezone="Asia/Shanghai"),
+        id=_RUN_RECORDS_CLEANUP_JOB_ID,
+        replace_existing=True,
+    )
+    _cleanup_run_records()
     for goal in goals_mod.list_all():
         if goal["status"] == "active":
             _register(goal)
@@ -64,6 +172,17 @@ def start() -> None:
 
 def _register(goal: dict) -> None:
     mode = goal.get("trigger_mode", "cron")
+    loop = discover().get(goal.get("loop", ""))
+    if not loop:
+        log.error(f"goal {goal.get('id')} 对应的 loop 不存在: {goal.get('loop')}")
+        return
+    supported_modes = tuple(getattr(loop, "supported_trigger_modes", ("cron", "goal")))
+    if mode not in supported_modes:
+        log.error(
+            f"goal {goal['id']} 的触发模式 {mode} 不受 loop={goal['loop']} 支持，"
+            f"支持：{supported_modes}"
+        )
+        return
 
     if mode == "event":
         # event 模式由 IMAPTool.idle_listen() 注册，不走 APScheduler
@@ -154,4 +273,6 @@ def resume_goal(goal_id: str) -> None:
 
 
 def stop() -> None:
+    if not _scheduler.running:
+        return
     _scheduler.shutdown(wait=False)

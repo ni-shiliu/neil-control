@@ -15,6 +15,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 .mypy_cache/
+.venv/
+.venv312/
+venv/
 
 # OS
 .DS_Store
@@ -24,3 +27,16 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Assistant runtime artifacts
+assistant/goals.json
+assistant/assistant.log
+assistant/effect_history.json
+assistant/run_records/
+assistant/.cli_history
+assistant/RUNTIME.md
+assistant/memory/*.json
+assistant/memory/goals/
+assistant/memory/loops/
+assistant/.venv/
+assistant/.venv312/

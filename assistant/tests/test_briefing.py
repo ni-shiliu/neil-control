@@ -31,5 +31,5 @@ if __name__ == "__main__":
 
     import json
     mem = memory_store.load(loop.name)
-    print(f"\n=== memory/daily_briefing_loop.json ===")
+    print(f"\n=== memory/loops/daily_briefing_loop.json ===")
     print(json.dumps(mem, ensure_ascii=False, indent=2))

@@ -75,7 +75,7 @@ def main() -> None:
 
     # 验证记忆是否写入
     mem = memory_store.load(loop.name)
-    print(f"\n>>> memory/email_loop.json:")
+    print(f"\n>>> memory/loops/email_loop.json:")
     import json
     print(json.dumps(mem, ensure_ascii=False, indent=2))
 

@@ -11,13 +11,20 @@ log = logging.getLogger(__name__)
 
 SMTP_HOST = "smtp.163.com"
 SMTP_PORT = 465
+SMTP_LOCAL_HOSTNAME = os.environ.get("SMTP_LOCAL_HOSTNAME", "localhost")
 
 
 class SMTPTool:
 
-    def __init__(self, host: str = SMTP_HOST, port: int = SMTP_PORT):
+    def __init__(
+        self,
+        host: str = SMTP_HOST,
+        port: int = SMTP_PORT,
+        local_hostname: str = SMTP_LOCAL_HOSTNAME,
+    ):
         self.host = host
         self.port = port
+        self.local_hostname = local_hostname
 
     @staticmethod
     def _text_to_html(text: str) -> str:
@@ -47,7 +54,11 @@ class SMTPTool:
         msg.attach(MIMEText(body, "plain", "utf-8"))
         msg.attach(MIMEText(self._text_to_html(body), "html", "utf-8"))
 
-        with smtplib.SMTP_SSL(self.host, self.port) as server:
+        with smtplib.SMTP_SSL(
+            self.host,
+            self.port,
+            local_hostname=self.local_hostname,
+        ) as server:
             server.login(sender, os.environ["EMAIL_PASS"])
             server.sendmail(sender, [to], msg.as_string())
         log.info(f"[smtp] 已发送至 {to}: {subj}")

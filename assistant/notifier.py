@@ -30,11 +30,8 @@ def _tg_chat_id() -> str:
 # ── macOS 系统通知 ────────────────────────────────────────
 
 def notify(title: str, message: str) -> None:
-    try:
-        script = f'display notification "{message}" with title "{title}"'
-        subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
-    except Exception as e:
-        log.warning(f"系统通知发送失败: {e}")
+    # 本地系统通知已关闭，保留函数仅为兼容旧调用。
+    log.debug(f"本地通知已禁用: {title} | {message}")
 
 
 # ── Telegram ─────────────────────────────────────────────

@@ -5,7 +5,7 @@ plan    → 并发抓取：天气 + 今日头条热榜 + GitHub Trending + Hacke
 execute → Claude 整理内容，动态决定当天 HTML 风格，生成完整 HTML
 verify  → 检查 HTML 长度
 fix     → 内容过短时重新生成
-report  → Telegram Bot 发送 HTML 文件
+report  → 返回摘要，由 Engine 统一分发 Telegram 文件通知
 """
 
 import concurrent.futures
@@ -13,17 +13,26 @@ import json
 import logging
 import os
 import re
-import tempfile
+from html import unescape
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import requests
 from bs4 import BeautifulSoup
-from claude_client import get_client, get_model
 
 from loops.base import BaseLoop
-import notifier
+
+if TYPE_CHECKING:
+    from engine.context import RunContext
 
 log = logging.getLogger(__name__)
+
+DEFAULT_BANNED_ENGLISH_PHRASES = [
+    "Let's circle back on this later.",
+    "Let's touch base next week.",
+    "Keep me posted.",
+    "Feel free to reach out.",
+]
 
 HEADERS = {
     "User-Agent": (
@@ -39,16 +48,118 @@ class DailyBriefingLoop(BaseLoop):
     name = "daily_briefing_loop"
     description = "每日简报：抓取天气+头条+GitHub+HN+36kr，Claude 生成动态 HTML 简报，Telegram 发送"
     required_tools = ["claude", "telegram"]
+    supported_trigger_modes = ("cron",)
+
+    @staticmethod
+    def _output_name(today: str) -> str:
+        safe_today = today.replace(" ", "_")
+        return f"daily_briefing_{safe_today}.html"
+
+    @staticmethod
+    def _delivery_effect_key(today: str, run_id: str) -> str:
+        safe_today = today.replace(" ", "_")
+        return f"briefing:{safe_today}:{run_id}:telegram_document"
+
+    def _set_output(self, result: dict, html: str, today: str, ctx: "RunContext | None" = None) -> None:
+        output = {
+            "output_type": "briefing_html",
+            "name": self._output_name(today),
+            "content": html,
+            "meta": {
+                "today": today,
+                "delivery_channel": "telegram_document",
+                "mime_type": "text/html",
+            },
+        }
+        result["outputs"] = [output]
+
+    def _queue_delivery_effect(self, result: dict, today: str, ctx: "RunContext | None" = None) -> None:
+        if not ctx:
+            return
+        output = next(
+            (a for a in result.get("outputs", []) if a.get("output_type") == "briefing_html"),
+            None,
+        )
+        if not output:
+            return
+
+        ctx.effects.add(
+            "send_telegram_document",
+            {
+                "content": output["content"],
+                "suffix": ".html",
+                "prefix": f"briefing_{datetime.now().strftime('%Y%m%d')}_",
+                "caption": f"📰 {today} 每日简报",
+            },
+            {
+                "success_bucket": "deliveries",
+                "success_item": {"channel": "telegram_document", "today": today},
+                "failure_item": {"channel": "telegram_document", "today": today},
+            },
+            idempotency_key=self._delivery_effect_key(today, ctx.run_id),
+        )
 
     def extract_memory(self, result: dict, old_memory: dict) -> dict:
         from datetime import datetime
+        totals = dict(old_memory.get("totals", {}))
+        totals["runs"] = int(totals.get("runs", 0)) + 1
+        totals["outputs"] = int(totals.get("outputs", 0)) + len(result.get("outputs", []))
+        totals["deliveries"] = int(totals.get("deliveries", 0)) + len(result.get("deliveries", []))
         return {
             **old_memory,
-            "last_sent": datetime.now().isoformat(),
-            "last_today": result.get("today", ""),
+            "totals": totals,
+            "last_updated_at": datetime.now().isoformat(),
         }
 
-    def _call_claude(self, prompt: str, max_tokens: int = 4096) -> str:
+    def extract_goal_memory(self, result: dict, old_memory: dict) -> dict:
+        from datetime import datetime
+        today = result.get("today", "")
+        outputs = result.get("outputs", [])
+        deliveries = result.get("deliveries", [])
+        english_phrase = result.get("english_phrase", "")
+        recent_briefings = list(old_memory.get("recent_briefings", []))
+        recent_entry = {
+            "today": today,
+            "output_count": len(outputs),
+            "delivery_count": len(deliveries),
+            "updated_at": datetime.now().isoformat(),
+        }
+        recent_briefings.append(recent_entry)
+        last_output = next(iter(outputs), {})
+        last_summary = (
+            f"today={today or '-'} "
+            f"outputs={len(outputs)} "
+            f"deliveries={len(deliveries)}"
+        )
+        recent_english_phrases = [
+            phrase
+            for phrase in (
+                list(old_memory.get("recent_english_phrases", [])) + [english_phrase]
+            )
+            if isinstance(phrase, str) and phrase.strip()
+        ]
+        return {
+            **old_memory,
+            "last_today": today,
+            "last_output_name": last_output.get("name", ""),
+            "last_delivery_count": len(deliveries),
+            "last_summary": last_summary,
+            "recent_briefings": recent_briefings[-5:],
+            "last_english_phrase": english_phrase,
+            "recent_english_phrases": recent_english_phrases[-5:],
+        }
+
+    def _call_claude(
+        self,
+        prompt: str,
+        max_tokens: int = 4096,
+        ctx: "RunContext | None" = None,
+    ) -> str:
+        if ctx and ctx.tools.claude:
+            return ctx.tools.claude.complete(prompt, max_tokens=max_tokens)
+
+        from claude_client import get_client, get_model
+
         msg = get_client().messages.create(
             model=get_model(),
             max_tokens=max_tokens,
@@ -208,8 +319,10 @@ class DailyBriefingLoop(BaseLoop):
         )
         return {"today": today, **results}
 
-    def _generate_english_block(self, today: str) -> str:
+    def _generate_english_block(self, today: str, ctx: "RunContext | None" = None) -> str:
         """单独生成每日英文模块 HTML 片段，确保不被遗漏。"""
+        banned_phrases = self._collect_recent_english_phrases(ctx)
+        banned_lines = "\n".join(f"- {phrase}" for phrase in banned_phrases[:20])
         result = self._call_claude(f"""今天是 {today}。
 
 请生成一个「每日英文」HTML 模块片段（不需要完整 HTML 文档，只需要一个 <section> 或 <div>）。
@@ -220,18 +333,70 @@ class DailyBriefingLoop(BaseLoop):
 3. 使用场景说明（什么时候用这句话）
 4. 一个完整的英文例句
 
+去重和风格要求：
+- 不要重复使用最近已经出现过的英文原句
+- 避免高频商务黑话和套话，尤其不要使用下面这些表达
+{banned_lines}
+- 优先选择更自然、具体、像真人会说的话
+- 职场和生活场景都可以，但不要总是会议/跟进类表达
+
 样式要求：
 - 内联样式，背景色用渐变或亮色突出显示
 - 每项前加对应 emoji：📝 英文原句  🌐 中文翻译  💡 使用场景  ✏️ 例句
 - 移动端友好
 
-只输出 HTML 片段，不要任何解释。""", max_tokens=1024)
+只输出 HTML 片段，不要任何解释。""", max_tokens=1024, ctx=ctx)
 
         # 清理可能的代码块包裹
         if result.startswith("```"):
             parts = result.split("```")
             result = parts[1].lstrip("html").strip() if len(parts) > 1 else result
         return result
+
+    def _collect_recent_english_phrases(self, ctx: "RunContext | None" = None) -> list[str]:
+        phrases: list[str] = []
+        seen: set[str] = set()
+
+        def _push(value: str) -> None:
+            if not isinstance(value, str):
+                return
+            normalized = value.strip()
+            if not normalized:
+                return
+            key = normalized.casefold()
+            if key in seen:
+                return
+            seen.add(key)
+            phrases.append(normalized)
+
+        for phrase in DEFAULT_BANNED_ENGLISH_PHRASES:
+            _push(phrase)
+
+        if not ctx:
+            return phrases
+
+        for phrase in ctx.goal_memory.get("recent_english_phrases", []):
+            _push(phrase)
+
+        for bucket in ("goal_recent_runs", "loop_recent_runs"):
+            for run in ctx.recent_runs.get(bucket, []):
+                if not isinstance(run, dict):
+                    continue
+                result = run.get("result", {})
+                if isinstance(result, dict):
+                    _push(result.get("english_phrase", ""))
+
+        return phrases
+
+    @staticmethod
+    def _extract_english_phrase(block_html: str) -> str:
+        text = unescape(re.sub(r"<[^>]+>", "\n", block_html))
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in lines:
+            normalized = line.replace("📝", "").replace("英文原句", "").strip("：: ").strip()
+            if normalized and any(ch.isalpha() for ch in normalized):
+                return normalized
+        return ""
 
     def _find_top_story_url(self, toutiao: list, hn: list, github: list) -> str:
         """从数据中找今日重点的 URL。"""
@@ -308,7 +473,7 @@ HTML 末尾留一个注释占位：<!-- ENGLISH_BLOCK -->
 
 只输出 HTML，不要任何解释文字。"""
 
-        html = self._call_claude(prompt, max_tokens=8192)
+        html = self._call_claude(prompt, max_tokens=8192, ctx=ctx)
 
         if not html.startswith("<!"):
             match = re.search(r"<!DOCTYPE.*", html, re.DOTALL | re.IGNORECASE)
@@ -317,7 +482,8 @@ HTML 末尾留一个注释占位：<!-- ENGLISH_BLOCK -->
 
         # ── 第二步：单独生成每日英文，强制插入 ───────────────
         log.info("生成每日英文模块...")
-        english_block = self._generate_english_block(today)
+        english_block = self._generate_english_block(today, ctx=ctx)
+        english_phrase = self._extract_english_phrase(english_block)
 
         # 插入到 </body> 前，如果有占位注释就替换，否则直接插入
         if "<!-- ENGLISH_BLOCK -->" in html:
@@ -325,7 +491,15 @@ HTML 末尾留一个注释占位：<!-- ENGLISH_BLOCK -->
         else:
             html = html.replace("</body>", f"\n{english_block}\n</body>")
 
-        return {"html": html, "today": today}
+        result = {
+            "html": html,
+            "today": today,
+            "deliveries": [],
+            "english_phrase": english_phrase,
+        }
+        self._set_output(result, html, today, ctx=ctx)
+        self._queue_delivery_effect(result, today, ctx=ctx)
+        return result
 
     def verify(self, result: dict) -> tuple[bool, str]:
         html = result.get("html", "")
@@ -342,30 +516,24 @@ HTML 末尾留一个注释占位：<!-- ENGLISH_BLOCK -->
 每日英文必须包含英文原句/中文翻译/使用场景/例句，板块顺序自由决定。
 
 只输出 HTML，不要解释。"""
-        html = self._call_claude(prompt, max_tokens=8192)
+        html = self._call_claude(prompt, max_tokens=8192, ctx=ctx)
         result["html"] = html
+        result.setdefault("deliveries", [])
+        result.setdefault("english_phrase", "")
+        self._set_output(result, html, result.get("today", ""), ctx=ctx)
+        self._queue_delivery_effect(result, result.get("today", ""), ctx=ctx)
         return result
 
     def report(self, result: dict) -> str:
-        html = result.get("html", "")
         today = result.get("today", "")
+        if result.get("deliveries"):
+            return f"每日简报已发送：{today}"
+        return f"每日简报已生成：{today}"
 
-        with tempfile.NamedTemporaryFile(
-            suffix=".html",
-            prefix=f"briefing_{datetime.now().strftime('%Y%m%d')}_",
-            delete=False,
-            mode="w",
-            encoding="utf-8",
-        ) as f:
-            f.write(html)
-            tmp_path = f.name
-
-        try:
-            notifier.notify_telegram_document(
-                file_path=tmp_path,
-                caption=f"📰 {today} 每日简报",
-            )
-        finally:
-            os.unlink(tmp_path)
-
-        return f"每日简报已发送：{today}"
+    def build_notifications(
+        self,
+        result: dict,
+        summary: str,
+        ctx: "RunContext | None" = None,
+    ) -> list[dict]:
+        return []

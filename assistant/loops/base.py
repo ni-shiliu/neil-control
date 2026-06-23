@@ -28,6 +28,8 @@ class BaseLoop(ABC):
     name: str = "base"
     description: str = ""
     required_tools: list[str] = []   # 声明依赖的工具，Engine 按需注入
+    supported_trigger_modes: tuple[str, ...] = ("cron", "goal")
+    use_loop_doc: bool = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -100,6 +102,19 @@ class BaseLoop(ABC):
 
     # ── Loop Engineering 扩展钩子（子类可选覆写）────────
 
+    def build_notifications(
+        self,
+        result: dict,
+        summary: str,
+        ctx: "RunContext | None" = None,
+    ) -> list[dict]:
+        """生成通知请求，由 Engine 统一分发。默认不发任何通知。"""
+        return []
+
+    def after_effects(self, result: dict, ctx: "RunContext | None" = None) -> dict:
+        """Engine 提交副作用后调用，允许 Loop 刷新衍生状态。"""
+        return result
+
     def is_goal_met(self, result: dict, memory: dict) -> bool:
         """目标模式：判断本次执行是否达成目标。
         默认返回 True（即 cron 模式，每次执行后视为完成）。
@@ -116,4 +131,8 @@ class BaseLoop(ABC):
         """持久记忆：把本次执行结果沉淀为跨 run 记忆，Engine 会保存返回值。
         默认不更新记忆（返回原记忆）。
         """
+        return old_memory
+
+    def extract_goal_memory(self, result: dict, old_memory: dict) -> dict:
+        """goal 级记忆：沉淀某个具体 goal 的短期状态。默认原样返回。"""
         return old_memory
