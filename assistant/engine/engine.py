@@ -251,6 +251,7 @@ class LoopEngine:
                 effect_log["ok"] = True
                 effect_log["status"] = "duplicate_skipped"
                 phase_data["effects"]["attempts"].append(effect_log)
+                self._apply_effect_success(result, effect)
                 continue
 
             try:

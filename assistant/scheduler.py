@@ -149,14 +149,17 @@ def _run_goal(goal_id: str) -> None:
 
 
 def run_goal_now(goal_id: str, *, dry_run_override: bool | None = None):
-    """手动立即执行某个 goal，不要求其当前处于 active。"""
+    """手动立即执行某个 active goal。paused goal 不允许通过命令绕过状态。"""
     goal = goals_mod.get(goal_id)
     if not goal:
+        return None
+    if goal.get("status") != "active":
+        log.warning(f"goal={goal_id} 当前状态为 {goal.get('status')}，拒绝手动执行")
         return None
     return _execute_goal(
         goal,
         notify_result=True,
-        allow_retry_schedule=goal.get("status") == "active",
+        allow_retry_schedule=True,
         dry_run_override=dry_run_override,
     )
 

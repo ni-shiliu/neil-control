@@ -683,6 +683,9 @@ def _cmd_rerun(goal_id: str, *, dry_run_override: bool | None = None) -> None:
     if not goal:
         print(f"未找到目标 {goal_id}")
         return
+    if goal.get("status") != "active":
+        print(f"goal {goal_id} 当前为 {goal.get('status')} 状态，不能执行。请先 resume 后再 rerun。")
+        return
     dry_run_label = dry_run_override if dry_run_override is not None else goal.get("dry_run", False)
     print(f"立即执行 {goal_id} ... (dry_run={dry_run_label})")
     run_result = scheduler.run_goal_now(goal_id, dry_run_override=dry_run_override)

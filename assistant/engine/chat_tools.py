@@ -333,8 +333,14 @@ def _tool_delete_goal(inp: dict) -> str:
 
 
 def _tool_rerun_goal(inp: dict) -> str:
+    import goals as goals_mod
     import scheduler
     goal_id = inp.get("goal_id", "")
+    goal = goals_mod.get(goal_id)
+    if not goal:
+        return f"未找到目标 {goal_id}"
+    if goal.get("status") != "active":
+        return f"goal {goal_id} 当前为 {goal.get('status')} 状态，不能执行。请先恢复后再执行。"
     dry_run_override = inp.get("dry_run")
     run_result = scheduler.run_goal_now(goal_id, dry_run_override=dry_run_override)
     if run_result is None:

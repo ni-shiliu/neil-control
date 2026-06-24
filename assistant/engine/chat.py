@@ -186,6 +186,7 @@ class ChatHarness:
 - 用户个人设置（"我时区是上海"）调 update_user_preferences
 - 完成所有 tool 调用后，用一句话告知用户执行结果，不要冗长
 - 如果确实无法处理，简短说明原因
+- 不要用 resume_goal + rerun_goal 组合绕过 paused 状态：用户的"执行/跑一下"指令不应改变 goal 的 paused/active 状态，paused goal 直接提示先恢复
 
 概念说明（不要混淆）：
 - loop 是已有的执行模块，不能通过对话新增；新增 loop 需要开发者写代码
