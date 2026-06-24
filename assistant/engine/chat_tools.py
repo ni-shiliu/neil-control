@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# 这些工具的结果直接打印给用户，不经过 Claude 转述（避免格式丢失或内容被压缩）
+_PRINT_DIRECT = {"list_goals", "show_goal"}
+
 # ── Tool Schemas ─────────────────────────────────────────────────────────────
 
 TOOL_SCHEMAS: list[dict] = [
@@ -210,30 +213,27 @@ TOOL_SCHEMAS: list[dict] = [
 def execute_tool(name: str, tool_input: dict, harness: "ChatHarness") -> str:
     """
     执行 tool，返回给 Claude 的字符串结果。
-    所有 print 输出同时作为结果返回，Claude 据此决定下一步。
+    _PRINT_DIRECT 中的查询工具直接打印给用户，其余由 Claude 转述。
     """
     try:
-        if name == "list_goals":
-            return _tool_list_goals(tool_input)
-        if name == "show_goal":
-            return _tool_show_goal(tool_input)
-        if name == "pause_goal":
-            return _tool_pause_goal(tool_input)
-        if name == "resume_goal":
-            return _tool_resume_goal(tool_input)
-        if name == "delete_goal":
-            return _tool_delete_goal(tool_input)
-        if name == "rerun_goal":
-            return _tool_rerun_goal(tool_input)
-        if name == "create_goal":
-            return _tool_create_goal(tool_input)
-        if name == "update_goal_preferences":
-            return _tool_update_goal_preferences(tool_input, harness)
-        if name == "update_loop_preferences":
-            return _tool_update_loop_preferences(tool_input, harness)
-        if name == "update_user_preferences":
-            return _tool_update_user_preferences(tool_input, harness)
-        return f"未知 tool: {name}"
+        _dispatch: dict = {
+            "list_goals":               lambda: _tool_list_goals(tool_input),
+            "show_goal":                lambda: _tool_show_goal(tool_input),
+            "pause_goal":               lambda: _tool_pause_goal(tool_input),
+            "resume_goal":              lambda: _tool_resume_goal(tool_input),
+            "delete_goal":              lambda: _tool_delete_goal(tool_input),
+            "rerun_goal":               lambda: _tool_rerun_goal(tool_input),
+            "create_goal":              lambda: _tool_create_goal(tool_input),
+            "update_goal_preferences":  lambda: _tool_update_goal_preferences(tool_input, harness),
+            "update_loop_preferences":  lambda: _tool_update_loop_preferences(tool_input, harness),
+            "update_user_preferences":  lambda: _tool_update_user_preferences(tool_input, harness),
+        }
+        if name not in _dispatch:
+            return f"未知 tool: {name}"
+        result = _dispatch[name]()
+        if name in _PRINT_DIRECT:
+            print(result)
+        return result
     except Exception as e:
         log.error(f"[chat_tools] tool={name} 执行异常: {e}", exc_info=True)
         return f"执行失败: {e}"

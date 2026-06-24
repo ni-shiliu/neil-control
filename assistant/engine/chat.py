@@ -1,13 +1,13 @@
 """
-ChatHarness — CLI 聊天链路的 agentic loop 引擎。
+ChatHarness — CLI 聊天链路的 agentic loop 适配器。
 
-与 LoopEngine 平行的 harness 架构：
+与 LoopEngine 的关系：
 
   LoopEngine.run()                  ChatHarness.run()
   ─────────────────────────────     ────────────────────────────────
   1. 加载记忆                        1. 加载记忆 (_build_context)
-  2. 构建 RunContext + tools         2. 构建 ChatContext + tool schemas
-  3. _run_phases()                   3. _run_agentic_loop()
+  2. 构建 RunContext + tools         2. 构建 ChatRuntimeContext
+  3. _execute_loop_template()        3. run_agentic_step()
      plan→execute→verify→fix→report     while True:
                                           Claude(messages, tools)
                                           stop_reason==end_turn → break
@@ -15,6 +15,11 @@ ChatHarness — CLI 聊天链路的 agentic loop 引擎。
                                           → append → continue
   4. 沉淀记忆                        4. 沉淀记忆 (_settle_memory)
   5. RunRecord                       5. conversation record (main.py)
+
+Loop 和 Harness 可以组合，但边界不同：
+  - LoopEngine 管目标推进和 run 生命周期
+  - HarnessRunner 管 AI 多轮工具调用
+  - 某个 loop 需要 agentic 能力时，可以在 execute/fix 中显式调用 HarnessRunner
 
 记忆分层：
   user memory   : 用户长期偏好（仅偏好，不放记录）
@@ -26,31 +31,25 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-from claude_client import get_client, get_model
+from engine.agentic_step import run_agentic_step
+from engine.harness import HarnessHooks, HarnessRunContext, HarnessState
 from engine.memory import MemoryStore
-from engine.chat_tools import TOOL_SCHEMAS, execute_tool
+from engine.runtime_context import ChatRuntimeContext, build_chat_runtime_context
+from engine.chat_tools import TOOL_SCHEMAS, execute_tool, _PRINT_DIRECT
 
 if TYPE_CHECKING:
     from conversation_records import ConversationRecorder
 
 log = logging.getLogger(__name__)
 
-_ASSISTANT_DIR = Path(__file__).resolve().parent.parent
 MAX_LOOP_ITERATIONS = 10  # 防止无限循环
-
-
-@dataclass
-class ChatContext:
-    user_input: str
-    goals: list[dict] = field(default_factory=list)
-    loops: dict = field(default_factory=dict)
-    recent_conversations: list[dict] = field(default_factory=list)
-    user_memory: dict = field(default_factory=dict)
-    runtime_doc: str = ""
+_ALIAS_BLOCKLIST = (
+    "暂停", "启动", "执行", "运行", "删除", "恢复", "查看", "显示",
+    "列出", "有哪些", "现在", "当前", "都", "全部", "这个", "那个",
+    "第", "一下", "一下子", "帮我", "给我",
+)
 
 
 class ChatHarness:
@@ -74,20 +73,33 @@ class ChatHarness:
         """
         ctx = self._build_context(user_input, goals=goals, loops=loops)
         system_prompt = self._build_system_prompt(ctx)
-        messages = [{"role": "user", "content": user_input}]
-
-        tool_calls: list[dict] = []
         final_text = ""
         success = True
 
         try:
-            final_text, tool_calls = self._run_agentic_loop(
-                messages, system_prompt
+            result = run_agentic_step(
+                system_prompt=system_prompt,
+                messages=[{"role": "user", "content": user_input}],
+                tools=TOOL_SCHEMAS,
+                execute_tool=lambda name, tool_input: execute_tool(name, tool_input, self),
+                metadata=self._build_metadata(ctx),
+                direct_tools=set(_PRINT_DIRECT),
+                hooks=HarnessHooks(
+                    before_model_call=self._before_model_call,
+                    after_tool_round=self._after_tool_round,
+                ),
+                max_iterations=MAX_LOOP_ITERATIONS,
             )
+            final_text = result.final_text
+            tool_calls = [
+                {"name": call.name, "input": call.input, "result": call.result}
+                for call in result.tool_calls
+            ]
         except Exception as e:
             log.error(f"[chat] agentic loop 异常: {e}", exc_info=True)
             final_text = f"执行出错：{e}"
             success = False
+            tool_calls = []
 
         self._settle_memory(tool_calls, ctx)
 
@@ -104,22 +116,46 @@ class ChatHarness:
 
     # ── Context 构建 ─────────────────────────────────────────────────────────
 
-    def _build_context(self, user_input: str, *, goals: list[dict], loops: dict) -> ChatContext:
-        recent = []
-        if self._conversation_recorder:
-            recent = self._conversation_recorder.list_recent(limit=10)
-        runtime_doc = self._read_optional_doc(_ASSISTANT_DIR / "RUNTIME.md")
-        user_memory = self.memory.load_user_memory()
-        return ChatContext(
+    def _build_context(self, user_input: str, *, goals: list[dict], loops: dict) -> ChatRuntimeContext:
+        return build_chat_runtime_context(
+            memory_store=self.memory,
+            conversation_recorder=self._conversation_recorder,
             user_input=user_input,
             goals=goals,
             loops=loops,
-            recent_conversations=recent,
-            user_memory=user_memory,
-            runtime_doc=runtime_doc,
         )
 
-    def _build_system_prompt(self, ctx: ChatContext) -> str:
+    @staticmethod
+    def _build_metadata(ctx: ChatRuntimeContext) -> dict:
+        return {
+            "user_input": ctx.user_input,
+            "goal_count": len(ctx.goals),
+            "loop_count": len(ctx.loops),
+        }
+
+    @staticmethod
+    def _before_model_call(run_ctx: HarnessRunContext, state: HarnessState) -> None:
+        log.debug(
+            "[chat] before_model_call iteration=%s goals=%s loops=%s",
+            state.iteration,
+            run_ctx.metadata.get("goal_count", 0),
+            run_ctx.metadata.get("loop_count", 0),
+        )
+
+    @staticmethod
+    def _after_tool_round(
+        _run_ctx: HarnessRunContext,
+        state: HarnessState,
+        tool_calls,
+    ) -> None:
+        if tool_calls:
+            log.debug(
+                "[chat] after_tool_round iteration=%s tools=%s",
+                state.iteration,
+                [call.name for call in tool_calls],
+            )
+
+    def _build_system_prompt(self, ctx: ChatRuntimeContext) -> str:
         goals_summary = self._summarize_goals(ctx.goals)
         loops_summary = self._summarize_loops(ctx.loops)
         user_memory_summary = self._summarize_user_memory(ctx.user_memory)
@@ -156,129 +192,63 @@ class ChatHarness:
 - `init loop <name>` 是为已有 loop 生成或更新规则文档（.md 文件），不是创建新 loop
 - goal 是基于已有 loop 创建的自动化任务，用户可以通过对话创建"""
 
-    # ── Agentic Loop ─────────────────────────────────────────────────────────
-
-    def _run_agentic_loop(
-        self,
-        messages: list[dict],
-        system_prompt: str,
-    ) -> tuple[str, list[dict]]:
-        """
-        核心循环：Reason → tool_use → tool_result → Reason → ... → stream end_turn
-
-        中间轮（有 tool_use）非流式，最后一轮（end_turn 纯文字）流式边收边打。
-        返回 (final_text, tool_calls_log)
-        """
-        client = get_client()
-        model = get_model()
-        tool_calls_log: list[dict] = []
-
-        for iteration in range(MAX_LOOP_ITERATIONS):
-            log.debug(f"[chat] iteration={iteration}")
-
-            # 先用非流式判断 stop_reason（tool_use 还是 end_turn）
-            response = client.messages.create(
-                model=model,
-                max_tokens=2048,
-                system=system_prompt,
-                tools=TOOL_SCHEMAS,
-                messages=messages,
-            )
-            log.debug(f"[chat] stop_reason={response.stop_reason}")
-
-            messages.append({"role": "assistant", "content": response.content})
-
-            if response.stop_reason == "end_turn":
-                # 纯文字回复：用流式重新请求，边收边打，给用户实时反馈
-                final_text = self._stream_final_response(
-                    messages=messages[:-1],  # 去掉刚才的 assistant 回复，重新 stream
-                    system_prompt=system_prompt,
-                )
-                return final_text, tool_calls_log
-
-            if response.stop_reason != "tool_use":
-                log.warning(f"[chat] 未预期的 stop_reason: {response.stop_reason}")
-                break
-
-            # tool_use：执行所有工具，回填 tool_result，进入下一轮
-            tool_results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                tool_name = block.name
-                tool_input = block.input if isinstance(block.input, dict) else {}
-
-                log.info(f"[chat] tool_use name={tool_name} input={json.dumps(tool_input, ensure_ascii=False)[:200]}")
-                result_text = execute_tool(tool_name, tool_input, self)
-                log.info(f"[chat] tool_result name={tool_name} result={result_text[:200]}")
-
-                tool_calls_log.append({
-                    "name": tool_name,
-                    "input": tool_input,
-                    "result": result_text,
-                })
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result_text,
-                })
-
-            messages.append({"role": "user", "content": tool_results})
-
-        log.warning(f"[chat] agentic loop 达到最大迭代次数 {MAX_LOOP_ITERATIONS}")
-        return "抱歉，处理超过最大步骤数，请重新描述需求。", tool_calls_log
-
-    def _stream_final_response(self, *, messages: list[dict], system_prompt: str) -> str:
-        """最后一轮用 streaming，边收边打，返回完整文字供记录。"""
-        client = get_client()
-        model = get_model()
-        chunks: list[str] = []
-
-        with client.messages.stream(
-            model=model,
-            max_tokens=2048,
-            system=system_prompt,
-            tools=TOOL_SCHEMAS,
-            messages=messages,
-        ) as stream:
-            for text in stream.text_stream:
-                print(text, end="", flush=True)
-                chunks.append(text)
-
-        print()  # 换行
-        return "".join(chunks)
-
     # ── 记忆沉淀 ─────────────────────────────────────────────────────────────
 
-    def _settle_memory(self, tool_calls: list[dict], ctx: ChatContext) -> None:
+    def _settle_memory(self, tool_calls: list[dict], ctx: ChatRuntimeContext) -> None:
         """
         loop 结束后沉淀记忆。
         目前只做一件事：从成功的 tool_call 里学习 goal 别名写入 user_memory。
         （偏好更新已在 tool executor 里直接写入 memory，这里不重复处理）
         """
         user_memory = self.memory.load_user_memory()
-        nicknames = dict(user_memory.get("goal_nicknames", {}))
-        updated = False
+        nicknames = self._sanitize_goal_nicknames(user_memory.get("goal_nicknames", {}))
+        updated = nicknames != dict(user_memory.get("goal_nicknames", {}))
 
         for call in tool_calls:
             name = call.get("name", "")
             inp = call.get("input", {})
             result = call.get("result", "")
 
-            # 执行成功的单目标操作，把 goal_id 和原始输入里的关键词学成别名
+            # 执行成功的单目标操作时，只学习“稳定名字型引用”，不学习动作句。
             if name in ("pause_goal", "resume_goal", "show_goal", "rerun_goal") and "已" in result:
                 goal_id = inp.get("goal_id", "")
-                # 从 user_input 里提取可能的别名（由 ctx 传入的 user_input）
-                # 只在 user_input 里有明显的自然语言引用（非 goal_id 格式）时写入
-                user_input = ctx.user_input
-                if goal_id and not user_input.startswith("goal_") and len(user_input) <= 20:
-                    if nicknames.get(user_input) != goal_id:
-                        nicknames[user_input] = goal_id
-                        updated = True
+                alias = self._extract_learnable_goal_alias(ctx.user_input)
+                if goal_id and alias and nicknames.get(alias) != goal_id:
+                    nicknames[alias] = goal_id
+                    updated = True
 
         if updated:
             self.memory.merge_save_user_memory({"goal_nicknames": nicknames})
             log.info(f"[chat] 学习别名更新: {nicknames}")
+
+    @classmethod
+    def _sanitize_goal_nicknames(cls, nicknames: dict | None) -> dict[str, str]:
+        if not isinstance(nicknames, dict):
+            return {}
+        sanitized: dict[str, str] = {}
+        for alias, goal_id in nicknames.items():
+            if not isinstance(alias, str) or not isinstance(goal_id, str):
+                continue
+            cleaned = cls._extract_learnable_goal_alias(alias)
+            if cleaned:
+                sanitized[cleaned] = goal_id
+        return sanitized
+
+    @classmethod
+    def _extract_learnable_goal_alias(cls, user_input: str) -> str | None:
+        alias = " ".join((user_input or "").split()).strip()
+        if not alias:
+            return None
+        if alias.startswith("goal_"):
+            return None
+        if len(alias) < 2 or len(alias) > 12:
+            return None
+        lowered = alias.lower()
+        if any(token in alias for token in _ALIAS_BLOCKLIST):
+            return None
+        if any(token in lowered for token in ("goal", "loop", "cron", "run", "rerun")):
+            return None
+        return alias
 
     # ── 辅助：context 摘要 ────────────────────────────────────────────────────
 
@@ -336,13 +306,3 @@ class ChatHarness:
                 f"  assistant: {assistant_text[:120]}"
             )
         return "\n".join(lines)
-
-    @staticmethod
-    def _read_optional_doc(path: Path) -> str:
-        if not path.exists():
-            return ""
-        try:
-            return path.read_text(encoding="utf-8").strip()
-        except Exception as e:
-            log.warning(f"[chat] 文档加载失败 path={path.name}: {e}")
-            return ""

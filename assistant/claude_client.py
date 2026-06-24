@@ -11,8 +11,12 @@ def get_client() -> anthropic.Anthropic:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "placeholder")
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
     auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+    timeout = float(os.environ.get("ANTHROPIC_TIMEOUT_SECONDS", "90"))
 
-    kwargs = {"api_key": api_key}
+    kwargs = {
+        "api_key": api_key,
+        "timeout": timeout,
+    }
     if base_url:
         kwargs["base_url"] = base_url
     if auth_token:

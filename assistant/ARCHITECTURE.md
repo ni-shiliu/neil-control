@@ -1,546 +1,562 @@
 # Assistant Architecture
 
-本文档只描述 `assistant/` 的当前运行时架构。
+本文档描述 `assistant/` 的当前运行时架构。它关注代码边界、执行链路和扩展方式；CLI 使用说明见 [README.md](./README.md)。
 
-它回答三类问题：
+## 1. 架构定位
 
-- 系统由哪些层组成
-- 一条输入如何流过这些层
-- 哪些边界由 runtime 统一接管
+Neil Assistant 是一个目标驱动的个人自动化运行时。
 
-使用方式和命令说明请看 [README.md](./README.md)。
+核心不是“写一堆脚本”，而是把用户目标沉淀成 `goal`，再由统一 runtime 负责触发、执行、记录、通知、记忆和重试。
 
-## 1. 设计目标
+当前架构由两条能力线组成：
 
-这套 runtime 的目标不是堆积脚本，而是把“目标驱动的个人自动化”收敛成统一执行系统。
+| 能力 | 解决的问题 | 核心代码 |
+|---|---|---|
+| `Loop` | 目标如何持续推进 | `LoopEngine` + `BaseLoop.run_once()` |
+| `Harness` | AI 如何多轮调用工具完成一步任务 | `HarnessRunner` + `run_agentic_step()` |
 
-核心要求：
+一句话：
 
-- 用户输入的是目标，不是函数调用
-- 不同任务共享同一套执行、记录、通知、重试机制
-- 业务逻辑与副作用、调度、存储分离
-- 每次运行都可追踪、可排障、可回放
-- 新增 Loop 时尽量不改主框架
+```text
+Loop 负责目标闭环，Harness 负责智能执行步骤。
+```
 
-## 2. 核心原则
-
-### 2.1 Goal 驱动
-
-系统先把输入收敛成 `goal`，再由 runtime 负责执行。
-
-职责边界：
-
-- `main.py`：输入与交互
-- `goals.py`：goal 持久化
-- `scheduler.py`：触发与重试
-- `LoopEngine`：单次运行生命周期
-- `loops/*`：业务逻辑
-
-### 2.2 本地优先，模型兜底
-
-输入路由顺序：
-
-1. 显式命令（list / pause / resume / delete / rerun / add 等）
-2. 自然语言输入 → ChatHarness agentic loop
-
-原则：
-
-- 明确的管理命令直接本地执行，不经过 AI
-- 自然语言输入全部由 ChatHarness 接管，Claude 通过 tool_use 驱动执行
-- `add` 命令是例外：显式触发 AI，但只做单轮 create_goal 解析
-
-### 2.3 Loop 只管业务
-
-Loop 不直接管理：
-
-- 调度
-- 幂等
-- effect 提交
-- run record 落盘
-- memory 落盘
-- 通知
-
-这些统一由 `LoopEngine` 接管。
-
-### 2.4 Output / Effect 分离
-
-- `output`：本次运行产物
-- `effect`：本次运行要提交的外部动作
-
-这层分离保证：
-
-- 产物可回看
-- 副作用可重放
-- “生成成功 / 发送失败”可分开定位
-
-### 2.5 分层 memory
-
-当前 memory 分层：
-
-- `user memory`：用户长期偏好，CLI 聊天写入，仅放偏好不放记录
-- `loop memory`：跨 goal 的 loop 级运行状态与偏好
-- `goal memory`：单 goal 的运行状态与偏好
-- `recent_runs`：最近运行轨迹
-- `RUNTIME.md`：用户手动编写的全局规则
-- `loops/<loop>.md`：loop 级长期规则
-
-其中：
-
-- JSON 保存运行时状态（程序自动写入）
-- Markdown 保存长期规则（用户手动编写）
-- `run_records` 保存事实历史
-- `conversation_records` 保存 CLI 聊天轮次历史
-
-### 2.6 受控增长
-
-memory 不是历史仓库。
-
-当前限制：
-
-- `user memory`：`8 KB`
-- `goal memory`：`8 KB`
-- `loop memory`：`16 KB`
-- `recent_runs`：默认最近 `5` 条
-- `conversation_records`：保留最近 `3` 天，单文件 `128 KB` / `100` 条
-
-超限后由 `MemoryStore` 自动压缩，`ConversationRecorder` 自动分片和清理。
-
-## 3. 组件视图
+## 2. 总览
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {
-  "primaryColor": "#E8F1FF",
+  "background": "#FFFFFF",
+  "primaryColor": "#E0F2FE",
   "primaryTextColor": "#0F172A",
-  "primaryBorderColor": "#2563EB",
+  "primaryBorderColor": "#0284C7",
   "lineColor": "#475569",
-  "secondaryColor": "#ECFDF5",
-  "tertiaryColor": "#FFF7ED",
   "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
 }}}%%
 flowchart TB
-    U["User / Trigger"] --> M["main.py"]
-    M -->|"显式命令"| CMD["Local Handlers"]
-    M -->|"自然语言"| CH["engine/chat.py\nChatHarness"]
-    CH --> CT["engine/chat_tools.py"]
-    CH --> MS
-    CT --> G
-    CT --> S
-    M --> G["goals.py"]
-    G --> S["scheduler.py"]
-    S --> E["engine/engine.py\nLoopEngine"]
-    E --> C["engine/context.py"]
-    E --> MS["engine/memory.py"]
-    E --> RR["engine/records.py"]
-    E --> FX["engine/effects.py"]
-    E --> L["loops/*"]
-    L --> T["engine/tools/*"]
-    E --> N["notifier.py"]
-    M --> CR["conversation_records.py"]
-    classDef entry fill:#E0F2FE,stroke:#0284C7,color:#082F49,stroke-width:1.5px;
-    classDef runtime fill:#E8F1FF,stroke:#2563EB,color:#172554,stroke-width:1.5px;
-    classDef chat fill:#EDE9FE,stroke:#7C3AED,color:#3B0764,stroke-width:1.5px;
-    classDef engine fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.5px;
-    classDef business fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.5px;
-    classDef support fill:#F5F3FF,stroke:#7C3AED,color:#4C1D95,stroke-width:1.5px;
-    class U entry;
-    class M,CMD,G,S runtime;
-    class CH,CT chat;
-    class E,C,MS,RR,FX engine;
-    class L,T business;
-    class N,CR support;
+    User["User / Trigger"]:::entry
+    Main["main.py\nCLI + command router"]:::runtime
+    Chat["ChatHarness\nCLI agent adapter"]:::harness
+    Agentic["run_agentic_step()\nshared harness adapter"]:::harness
+    Runner["HarnessRunner\nAI -> tool_use -> tool_result"]:::harness
+    Tools["chat_tools.py\nCLI tools"]:::support
+    Goals["goals.py\ngoal store"]:::runtime
+    Scheduler["scheduler.py\ncron / event / retry"]:::runtime
+    Engine["LoopEngine.run()\nrun lifecycle"]:::loop
+    Base["BaseLoop.run_once()\ntemplate method"]:::loop
+    Loops["loops/*\nbusiness loops"]:::business
+    Email["email_loop.execute()\nagentic email step"]:::business
+    Effects["effects.py\nintent + idempotency"]:::support
+    Memory["memory.py\nuser / loop / goal"]:::support
+    Records["records.py\nrun_records"]:::support
+    Conv["conversation_records.py\nchat history"]:::support
+    External["engine/tools/*\nIMAP / SMTP / Telegram / Claude"]:::external
+
+    User --> Main
+    Main -->|"explicit command"| Goals
+    Main -->|"natural language"| Chat
+    Chat --> Agentic --> Runner --> Tools --> Goals
+    Main --> Conv
+    Goals --> Scheduler --> Engine
+    Main -->|"rerun"| Engine
+    Engine --> Memory
+    Engine --> Records
+    Engine --> Base --> Loops
+    Loops --> Effects
+    Email --> Agentic
+    Effects --> External
+    Loops --> External
+
+    classDef entry fill:#DBEAFE,stroke:#2563EB,color:#172554,stroke-width:2px;
+    classDef runtime fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:2px;
+    classDef loop fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:2px;
+    classDef harness fill:#F5E8FF,stroke:#9333EA,color:#581C87,stroke-width:2px;
+    classDef business fill:#FEF9C3,stroke:#CA8A04,color:#713F12,stroke-width:2px;
+    classDef support fill:#F1F5F9,stroke:#64748B,color:#0F172A,stroke-width:1.5px;
+    classDef external fill:#FFE4E6,stroke:#E11D48,color:#881337,stroke-width:1.5px;
 ```
 
-### 3.1 模块职责
+## 3. 核心分层
 
-| 模块 | 职责 |
+| 层 | 模块 | 职责 |
+|---|---|---|
+| CLI | `main.py` | 输入循环、显式命令、本地输出、对话记录 |
+| Chat Harness | `engine/chat.py` | 将自然语言管理请求转成 agentic step |
+| Harness Core | `engine/agentic_step.py`, `engine/harness.py` | AI 多轮工具调用底座 |
+| Goal Store | `goals.py` | goal 创建、状态、失败计数、最近结果 |
+| Scheduler | `scheduler.py` | cron、event、立即执行、失败重试 |
+| Loop Runtime | `engine/engine.py` | 单次 run 生命周期、记录、通知、记忆、重调度 |
+| Loop Template | `loops/base.py` | 模板方法，固定单次 loop 闭环 |
+| Business Loops | `loops/*` | 具体业务逻辑 |
+| Effects | `engine/effects.py` | 副作用意图、幂等 key、统一提交 |
+| Memory | `engine/memory.py` | user / loop / goal memory 读写与压缩 |
+| Records | `engine/records.py` | run_records 按 goal + loop + 日期落盘 |
+
+## 4. Loop 架构
+
+Loop 处理的是目标推进，不是单次函数调用。
+
+标准闭环：
+
+```text
+goal
+-> plan
+-> execute
+-> effects
+-> verify / fix
+-> report
+-> memory
+-> is_goal_met / next_trigger
+```
+
+### 4.1 模板方法
+
+模板方法在 [BaseLoop.run_once()](./loops/base.py)。
+
+它固定单次 loop 的内部骨架：
+
+```text
+BaseLoop.run_once(goal, ctx, commit_effects)
+  -> plan(goal, ctx)
+  -> execute(context, ctx)
+  -> commit_effects(...)
+  -> after_effects(...)
+  -> verify(result)
+  -> fix(result, issues, ctx) if needed
+  -> report(result)
+```
+
+子类只实现变化点：
+
+| 方法 | 职责 |
 |---|---|
-| `main.py` | CLI 入口、显式命令路由、输入分发 |
-| `engine/chat.py` | CLI 聊天 agentic loop 引擎，构建 context、驱动 Claude tool_use、沉淀记忆 |
-| `engine/chat_tools.py` | CLI agentic loop 的 tool schema 定义与执行器 |
-| `ai_input_resolver.py` | `add` 命令专用的单轮 create_goal 解析 |
-| `conversation_records.py` | CLI 聊天轮次持久化，3 天滚动保留 |
-| `goals.py` | goal 持久化与状态更新 |
-| `scheduler.py` | 定时触发、event 触发、失败重试 |
-| `engine/engine.py` | 单次 run 主流程（LoopEngine） |
-| `engine/memory.py` | memory 读写与压缩（user / loop / goal 三层） |
-| `engine/records.py` | run record 落盘与清理 |
-| `engine/effects.py` | effect 提交与幂等 |
-| `loops/*` | 业务实现 |
-| `engine/tools/*` | 外部能力封装 |
+| `plan()` | 准备本次执行上下文 |
+| `execute()` | 执行业务动作，可选择普通代码或 harness |
+| `verify()` | 验证结果是否可接受 |
+| `fix()` | 修复失败结果 |
+| `report()` | 生成摘要，不直接通知 |
+| `after_effects()` | effect 提交后刷新衍生状态 |
+| `extract_memory()` | 写 loop 级记忆 |
+| `extract_goal_memory()` | 写 goal 级记忆 |
+| `is_goal_met()` | 判断目标是否完成 |
+| `next_trigger()` | 未完成时给出下次触发时间 |
 
-## 3.2 AI 逻辑全景
+### 4.2 LoopEngine
 
-当前代码里的 AI 分为三层：
+[LoopEngine.run()](./engine/engine.py) 是系统级主入口，不是模板方法。
 
-1. CLI 聊天层（ChatHarness agentic loop）
-2. 引擎注入层（LoopEngine → ClaudeTool）
-3. Loop 执行层（业务内容生成）
+它负责外围生命周期：
 
-### 3.2.1 AI 分层图
-
-```mermaid
-%%{init: {"theme": "base", "themeVariables": {
-  "primaryColor": "#E8F1FF",
-  "primaryTextColor": "#0F172A",
-  "primaryBorderColor": "#2563EB",
-  "lineColor": "#475569",
-  "secondaryColor": "#ECFDF5",
-  "tertiaryColor": "#FFF7ED",
-  "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
-}}}%%
-flowchart TB
-    U["User Input"] --> M["main.py"]
-    M -->|"显式命令"| CMD["Local Handlers"]
-    M -->|"自然语言"| CH["ChatHarness"]
-    CH -->|"tool_use loop"| CL1["Claude API\n（管理决策）"]
-    CL1 -->|"execute_tool"| CT["chat_tools.py"]
-    CT --> G["goals / scheduler"]
-    M -->|"add 命令"| AIR["ai_input_resolver.py"]
-    AIR --> CL1
-    M --> S["scheduler.py"]
-    S --> E["LoopEngine.run()"]
-    E --> RC["RunContext + ToolRegistry"]
-    RC --> CL2["ctx.tools.claude\n（ClaudeTool）"]
-    CL2 --> DB["daily_briefing_loop"]
-    CL2 --> EM["email_loop"]
-    CC["claude_client.py"] --> CL1
-    CC --> CL2
-    classDef input fill:#E0F2FE,stroke:#0284C7,color:#082F49,stroke-width:1.5px;
-    classDef chat fill:#EDE9FE,stroke:#7C3AED,color:#3B0764,stroke-width:1.5px;
-    classDef runtime fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.5px;
-    classDef loop fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.5px;
-    classDef infra fill:#F5F3FF,stroke:#7C3AED,color:#4C1D95,stroke-width:1.5px;
-    class U input;
-    class M,CMD runtime;
-    class CH,CT,AIR chat;
-    class S,E,RC runtime;
-    class DB,EM loop;
-    class CL1,CL2,CC infra;
+```text
+LoopEngine.run(loop, goal)
+  -> build_loop_run_context()
+  -> loop.run_once()
+  -> notify
+  -> save loop memory
+  -> save goal memory
+  -> maybe reschedule
+  -> save run record
 ```
 
-### 3.2.2 CLI 聊天层（ChatHarness）
+边界：
 
-自然语言输入全部由 `ChatHarness` 接管，走 agentic loop：
+| LoopEngine 负责 | BaseLoop 负责 |
+|---|---|
+| 构建 `RunContext` | 固定阶段顺序 |
+| 注入 tools / memory / recent_runs / docs | 调用子类业务钩子 |
+| 提交 effects | 生成 effect 意图 |
+| 通知 | 生成通知请求 |
+| memory 落盘 | memory 内容抽取 |
+| run_records 落盘 | phase_data 生成 |
+| goal 重调度 | `is_goal_met()` / `next_trigger()` 判断 |
 
-1. 构建 `ChatContext`（goals、loops、user_memory、recent_conversations、RUNTIME.md）
-2. 构建 system prompt，注入全量上下文
-3. 进入 while 循环：
-   - Claude 决策 → `tool_use`：执行 `chat_tools` 中的对应函数，回填 `tool_result`，继续循环
-   - Claude 决策 → `end_turn`：最后一轮改用 streaming，边收边打，退出循环
-4. 沉淀记忆（学习 goal 别名等）
+## 5. Harness 架构
 
-可用工具：`list_goals` / `show_goal` / `pause_goal` / `resume_goal` / `delete_goal` / `rerun_goal` / `create_goal` / `update_goal_preferences` / `update_loop_preferences` / `update_user_preferences`
+Harness 处理的是 AI 多轮工具调用。
 
-### 3.2.3 引擎注入层
+核心循环在 [HarnessRunner](./engine/harness.py)：
 
-这一层在 `LoopEngine.run()` 内完成，与 CLI 输入理解完全解耦。
+```text
+while iteration < max_iterations:
+    Claude(messages, tools)
 
-职责：
-- 构建 `RunContext`
-- 根据 `required_tools` 构建 `ToolRegistry`
-- 将 `claude` 能力注入到 `ctx.tools.claude`
+    if stop_reason == tool_use:
+        execute_tool(name, input)
+        append tool_result
+        continue
 
-### 3.2.4 Loop 执行层
+    if stop_reason == end_turn:
+        return final_text
+```
 
-这一层发生在 goal 真正运行时，Loop 通过 `ctx.tools.claude` 调用 AI。
+### 5.1 通用入口
 
-`daily_briefing_loop`：整理资讯、生成英文短句、生成 HTML 简报、fix 阶段重新生成
+[run_agentic_step()](./engine/agentic_step.py) 是 CLI 和 Loop 共用的轻量适配层。
 
-`email_loop`：判断是否需要回复、生成回复正文、决定动作（回复 / 草稿 / 升级）、审查质量
+它负责装配：
 
-### 3.2.5 Claude 调用底座
+| 参数 | 含义 |
+|---|---|
+| `system_prompt` | 当前 agentic step 的规则 |
+| `messages` | 当前输入 |
+| `tools` | Claude tool schema |
+| `execute_tool` | 本地工具执行函数 |
+| `metadata` | run 级稳定信息 |
+| `direct_tools` | 调用后可直接结束的工具 |
+| `hooks` | 可选生命周期回调 |
 
-所有 AI 调用共享同一个 client 工厂：`claude_client.py::get_client()` / `get_model()`
+### 5.2 为什么不复用 ChatHarness
 
-## 4. 运行链路
+`ChatHarness` 是 CLI 管理场景适配器，绑定了 goals、loops、chat_tools、conversation_records、用户记忆沉淀等逻辑。
 
-### 4.1 启动链路
+Loop 内部不应该复用 `ChatHarness`，而应该复用更底层的 `run_agentic_step()`。
+
+```text
+HarnessRunner
+  <- run_agentic_step()
+      <- ChatHarness
+      <- email_loop.execute()
+      <- future agentic loops
+```
+
+## 6. Loop + Harness
+
+Loop 和 Harness 的组合点在 `execute()` 或 `fix()`。
+
+```text
+BaseLoop.run_once()
+  -> execute()
+      -> 普通 loop：直接业务代码
+      -> agentic loop：run_agentic_step()
+  -> verify()
+  -> report()
+```
+
+这保证：
+
+| 设计点 | 结果 |
+|---|---|
+| Loop 不被 Harness 替代 | 目标闭环仍然稳定 |
+| Harness 不接管 Engine | AI 只负责某一步智能执行 |
+| Effects 仍由 Engine 提交 | dry-run、幂等、记录保持一致 |
+| 普通 loop 不强制 agentic | 简单任务仍然简单 |
+
+### 6.1 email_loop 当前实现
+
+`email_loop` 是当前第一个 Loop + Harness 实现。
+
+执行链路：
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {
-  "primaryColor": "#E8F1FF",
+  "background": "#FFFFFF",
+  "primaryColor": "#FFF7ED",
   "primaryTextColor": "#0F172A",
-  "primaryBorderColor": "#2563EB",
+  "primaryBorderColor": "#EA580C",
   "lineColor": "#475569",
-  "secondaryColor": "#ECFDF5",
-  "tertiaryColor": "#FFF7ED",
   "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
 }}}%%
 sequenceDiagram
-    participant U as User
-    participant M as main.py
-    participant G as goals.py
-    participant S as scheduler.py
-    participant A as APScheduler
+    participant S as scheduler / rerun
+    participant E as LoopEngine
+    participant B as BaseLoop.run_once
+    participant L as email_loop
+    participant A as run_agentic_step
+    participant H as HarnessRunner
+    participant T as email tools
+    participant FX as EffectCollector
+    participant EXT as IMAP / SMTP
 
-    U->>M: python3.12 main.py
-    M->>M: load_dotenv()
-    M->>M: 加载 Banner / CLI
-    M->>S: start()
-    S->>A: start scheduler
-    S->>S: register cleanup job
-    S->>G: list_all()
-    loop active goals
-        S->>A: add_job(_run_goal)
+    S->>E: run(email_loop, goal)
+    E->>B: loop.run_once(goal, ctx)
+    B->>L: plan()
+    L-->>B: unread emails
+    B->>L: execute()
+    loop each email
+        L->>L: static skip rules
+        alt needs AI decision
+            L->>A: run_agentic_step(system_prompt, tools)
+            A->>H: run()
+            H->>H: Claude decides tool_use
+            H->>T: skip_email / save_draft / send_reply
+            T->>FX: add effect intent
+            H-->>A: HarnessResult
+            A-->>L: tool_calls
+        end
     end
-    M-->>U: CLI ready
+    B->>E: commit_effects()
+    E->>EXT: mark_read / save_draft / send_email
+    B->>L: verify() / fix() / report()
+    B-->>E: LoopRunOnceResult
+    E->>E: memory / record / reschedule
 ```
 
-### 4.2 输入路由链路
+email harness 暴露的工具：
+
+| Tool | Effect | 用途 |
+|---|---|---|
+| `skip_email` | `mark_read` | 无需回复，标记已读 |
+| `save_draft` | `save_draft_and_mark_read` | 生成草稿，等待人工确认 |
+| `send_reply` | `send_email_and_mark_read` | 低风险且允许自动发送时直接回复 |
+
+注意：这些工具不直接操作邮箱，只登记 effect。真正副作用仍由 `LoopEngine` 统一提交。
+
+## 7. CLI 链路
+
+CLI 分两种输入。
+
+### 7.1 显式命令
+
+```text
+user input
+-> main.py
+-> local handler
+-> goals / scheduler / LoopEngine
+```
+
+典型命令：
+
+```text
+list
+pause <goal_id>
+resume <goal_id>
+delete <goal_id>
+rerun <goal_id>
+add <goal description>
+```
+
+### 7.2 自然语言
+
+自然语言进入 CLI harness。
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {
-  "primaryColor": "#E8F1FF",
+  "background": "#FFFFFF",
+  "primaryColor": "#F5E8FF",
   "primaryTextColor": "#0F172A",
-  "primaryBorderColor": "#2563EB",
+  "primaryBorderColor": "#9333EA",
   "lineColor": "#475569",
-  "secondaryColor": "#ECFDF5",
-  "tertiaryColor": "#FFF7ED",
-  "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
-}}}%%
-flowchart LR
-    A["User Input"] --> B["main.py\n_process_input()"]
-    B --> C{"显式命令?"}
-    C -->|"list/pause/resume\ndelete/rerun/goal…"| D["Local Handler\n直接执行"]
-    C -->|"add 描述"| E["ai_input_resolver\n单轮 create_goal 解析"]
-    C -->|"自然语言"| F["ChatHarness\nagentic loop"]
-    E --> G["goals.py + scheduler.py"]
-    F --> G
-    D --> G
-    style A fill:#E0F2FE,stroke:#0284C7,color:#082F49,stroke-width:1.5px
-    style B fill:#E8F1FF,stroke:#2563EB,color:#172554,stroke-width:1.5px
-    style C fill:#F8FAFC,stroke:#64748B,color:#0F172A,stroke-width:1.5px
-    style D fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.5px
-    style E fill:#EDE9FE,stroke:#7C3AED,color:#3B0764,stroke-width:1.5px
-    style F fill:#EDE9FE,stroke:#7C3AED,color:#3B0764,stroke-width:1.5px
-    style G fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:1.5px
-```
-
-### 4.3 CLI Agentic Loop 链路
-
-```mermaid
-%%{init: {"theme": "base", "themeVariables": {
-  "primaryColor": "#E8F1FF",
-  "primaryTextColor": "#0F172A",
-  "primaryBorderColor": "#2563EB",
-  "lineColor": "#475569",
-  "secondaryColor": "#ECFDF5",
-  "tertiaryColor": "#FFF7ED",
   "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
 }}}%%
 sequenceDiagram
     participant U as User
     participant M as main.py
     participant CH as ChatHarness
-    participant MS as MemoryStore
-    participant C as Claude API
+    participant AS as run_agentic_step
+    participant H as HarnessRunner
     participant CT as chat_tools
     participant G as goals / scheduler
+    participant CR as conversation_records
 
     U->>M: 自然语言输入
     M->>CH: run(user_input, goals, loops)
-    CH->>MS: load user_memory
-    CH->>CH: build ChatContext + system_prompt
-    CH->>C: messages.create(tools=TOOL_SCHEMAS)
+    CH->>CH: build ChatRuntimeContext
+    CH->>AS: run_agentic_step()
+    AS->>H: HarnessRunner.run()
     loop tool_use
-        C-->>CH: stop_reason=tool_use
-        CH->>CT: execute_tool(name, input)
-        CT->>G: pause/resume/create/update…
-        CT-->>CH: result_text
-        CH->>C: tool_result 回填，继续
+        H->>CT: execute_tool(name, input)
+        CT->>G: list / pause / resume / create / update
+        CT-->>H: tool_result
     end
-    C-->>CH: stop_reason=end_turn
-    CH->>C: messages.stream（最后一轮流式）
-    C-->>U: 逐字输出最终回复
-    CH->>MS: settle_memory（学习别名等）
-    CH-->>M: interaction dict
-    M->>M: record_conversation
+    H-->>CH: HarnessResult
+    CH->>CH: settle_memory
+    CH-->>M: interaction
+    M->>CR: record conversation
 ```
 
-### 4.4 Goal 创建链路（add 命令）
+## 8. Goal 执行链路
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {
-  "primaryColor": "#E8F1FF",
+  "background": "#FFFFFF",
+  "primaryColor": "#ECFDF5",
   "primaryTextColor": "#0F172A",
-  "primaryBorderColor": "#2563EB",
+  "primaryBorderColor": "#059669",
   "lineColor": "#475569",
-  "secondaryColor": "#ECFDF5",
-  "tertiaryColor": "#FFF7ED",
   "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
 }}}%%
-sequenceDiagram
-    participant U as User
-    participant M as main.py
-    participant AIR as ai_input_resolver
-    participant C as Claude API
-    participant G as goals.py
-    participant S as scheduler.py
+flowchart LR
+    Trigger["cron / event / rerun"]:::entry
+    Scheduler["scheduler.py"]:::runtime
+    Engine["LoopEngine.run()"]:::runtime
+    Context["build_loop_run_context()"]:::support
+    Template["BaseLoop.run_once()"]:::loop
+    Business["loop hooks\nplan / execute / verify / report"]:::business
+    Effects["commit effects"]:::support
+    Notify["notify"]:::support
+    Memory["save memory"]:::support
+    Records["save run_records"]:::support
+    Reschedule["maybe reschedule"]:::support
 
-    U->>M: add [--dry-run] 描述
-    M->>AIR: ai_resolve_input(description, goals, loops)
-    AIR->>C: 单轮解析（create_goal）
-    C-->>AIR: {kind: create_goal, goal: {...}}
-    AIR-->>M: result
-    M->>G: add(...)
-    M->>S: add_goal(...)
-    M-->>U: ✓ 已添加目标
+    Trigger --> Scheduler --> Engine
+    Engine --> Context --> Template --> Business
+    Template --> Effects --> Business
+    Template --> Engine
+    Engine --> Notify
+    Engine --> Memory
+    Engine --> Reschedule
+    Engine --> Records
+
+    classDef entry fill:#DBEAFE,stroke:#2563EB,color:#172554,stroke-width:2px;
+    classDef runtime fill:#ECFDF5,stroke:#059669,color:#064E3B,stroke-width:2px;
+    classDef loop fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:2px;
+    classDef business fill:#FEF9C3,stroke:#CA8A04,color:#713F12,stroke-width:2px;
+    classDef support fill:#F1F5F9,stroke:#64748B,color:#0F172A,stroke-width:1.5px;
 ```
 
-### 4.5 Goal 执行链路
+## 9. Memory 与 Records
 
-```mermaid
-%%{init: {"theme": "base", "themeVariables": {
-  "primaryColor": "#E8F1FF",
-  "primaryTextColor": "#0F172A",
-  "primaryBorderColor": "#2563EB",
-  "lineColor": "#475569",
-  "secondaryColor": "#ECFDF5",
-  "tertiaryColor": "#FFF7ED",
-  "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
-}}}%%
-sequenceDiagram
-    participant T as Trigger
-    participant S as scheduler.py
-    participant E as LoopEngine
-    participant MS as MemoryStore
-    participant RR as RunRecorder
-    participant L as Loop
-    participant FX as EffectStore
-    participant N as notifier
+### 9.1 Memory 分层
 
-    T->>S: cron / goal / event / rerun
-    S->>E: run(loop, goal)
-    E->>MS: load loop memory
-    E->>MS: load goal memory
-    E->>RR: load recent runs
-    E->>L: plan()
-    E->>L: execute()
-    E->>L: verify()
-    opt verify failed
-        E->>L: fix()
-    end
-    E->>FX: commit effects
-    E->>MS: save memories
-    E->>RR: save run record
-    S->>N: notify
-```
-
-### 4.6 Event 链路
-
-```mermaid
-%%{init: {"theme": "base", "themeVariables": {
-  "primaryColor": "#E8F1FF",
-  "primaryTextColor": "#0F172A",
-  "primaryBorderColor": "#2563EB",
-  "lineColor": "#475569",
-  "secondaryColor": "#ECFDF5",
-  "tertiaryColor": "#FFF7ED",
-  "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
-}}}%%
-sequenceDiagram
-    participant M as main.py
-    participant S as scheduler.py
-    participant I as IMAPTool
-    participant E as LoopEngine
-
-    M->>S: add event goal
-    S->>I: idle_listen(callback)
-    I-->>S: mail event
-    S->>E: run(email_loop, goal)
-```
-
-## 5. 核心数据
-
-### 5.1 Goal
-
-`goal` 是持续任务定义。
-
-关键字段：
-
-- `id`
-- `raw`
-- `loop`
-- `status`
-- `schedule`
-- `trigger_mode`
-- `goal_condition`
-- `dry_run`
-- `retry_*`
-- `failure_count`
-- `last_run`
-- `last_result`
-- `last_run_meta`
-
-### 5.2 Run Record
-
-`run_records/<goal_id>_<loop_name>_<YYYY-MM-DD>.json`
-
-职责：
-
-- 保存当日该 goal 的运行事实
-- 作为排障主入口
-- 为 `recent_runs` 提供短期上下文
-
-### 5.3 Memory
-
-| 层级 | 路径 | 写入方 | 职责 |
+| 层级 | 路径 | 内容 | 写入方 |
 |---|---|---|---|
-| `user memory` | `memory/user/user.json` | ChatHarness | 用户长期偏好、goal 别名 |
-| `loop memory` | `memory/loops/<loop>.json` | LoopEngine / ChatHarness | loop 级运行状态与偏好 |
-| `goal memory` | `memory/goals/<goal_id>.json` | LoopEngine / ChatHarness | goal 级运行状态与偏好 |
-| `recent_runs` | `run_records/` | LoopEngine | 运行事实历史 |
-| `conversation_records` | `conversation_records/` | main.py | CLI 聊天轮次历史 |
-| `RUNTIME.md` | `RUNTIME.md` | 用户手动 | 用户全局规则（声明式） |
-| `loops/<loop>.md` | `loops/<name>.md` | 用户手动 | loop 级长期规则（声明式） |
+| User memory | `memory/user/user.json` | 用户长期偏好、goal 别名 | `ChatHarness` |
+| Loop memory | `memory/loops/<loop>.json` | loop 级偏好、聚合状态 | `LoopEngine`, `ChatHarness` |
+| Goal memory | `memory/goals/<goal_id>.json` | goal 专属偏好、近期状态 | `LoopEngine`, `ChatHarness` |
+| Runtime doc | `RUNTIME.md` | 用户手写全局规则 | 用户 |
+| Loop doc | `loops/<loop>.md` | loop 级手写规则 | 用户 |
 
-## 6. 触发模式
+原则：
+
+```text
+JSON memory = 程序自动维护的状态
+Markdown docs = 用户手写的长期规则
+run_records = 事实历史
+conversation_records = 对话历史
+```
+
+### 9.2 Run Records
+
+`run_records` 保存 loop 执行事实，不保存 CLI 对话。
+
+当前命名策略：
+
+```text
+run_records/<goal_id>_<loop_name>_<YYYY-MM-DD>.json
+```
+
+内容包括：
+
+| 字段 | 说明 |
+|---|---|
+| `run_id` | 本次运行 ID |
+| `goal_id` | 对应 goal |
+| `loop_name` | 对应 loop |
+| `phase_data` | plan / execute / effects / verify / report 阶段数据 |
+| `planned_effects` | 计划副作用 |
+| `committed_effects` | 提交结果 |
+| `memory_before/after` | loop memory 变化 |
+| `goal_memory_before/after` | goal memory 变化 |
+| `notifications` | 通知结果 |
+| `next_trigger_in_seconds` | 目标未完成时的下次触发 |
+
+### 9.3 Conversation Records
+
+`conversation_records` 保存 CLI 聊天历史，用于自然语言上下文。
+
+它与 `run_records` 分离：
+
+| 类型 | 保存什么 |
+|---|---|
+| `run_records` | loop 执行事实 |
+| `conversation_records` | 用户输入、AI tool_calls、AI 回复、执行结果 |
+
+## 10. Effect 机制
+
+Loop 不直接提交外部副作用，而是声明 effect。
+
+```text
+loop.execute()
+  -> ctx.effects.add(...)
+
+BaseLoop.run_once()
+  -> commit_effects callback
+
+LoopEngine
+  -> _apply_effect()
+  -> mark seen for idempotency
+```
+
+常见 effect：
+
+| Effect | 外部动作 |
+|---|---|
+| `mark_read` | IMAP 标记已读 |
+| `send_email_and_mark_read` | SMTP 发送 + IMAP 标记已读 |
+| `save_draft_and_mark_read` | IMAP 保存草稿 + 标记已读 |
+| `send_telegram_document` | Telegram 发送文件 |
+
+效果：
+
+```text
+dry_run 可控
+幂等可控
+失败可记录
+生成与提交可分离
+```
+
+## 11. 触发模式
 
 | 模式 | 说明 | 典型场景 |
 |---|---|---|
 | `cron` | 固定时间触发 | 每日简报 |
 | `goal` | 未达成前持续推进 | 收件箱清零 |
-| `event` | 外部事件触发 | 新邮件即时处理 |
+| `event` | 外部事件触发 | 新邮件触发 email_loop |
 
-## 7. Loop 接口
+## 12. 新增 Loop
 
-`BaseLoop` 的核心钩子：
-
-- `plan(goal, ctx=None)`
-- `execute(context, ctx=None)`
-- `verify(result)`
-- `fix(result, issues, ctx=None)`
-- `report(result)`
-
-常用扩展钩子：
-
-- `extract_memory(result, old_memory)`
-- `extract_goal_memory(result, old_memory)`
-- `is_goal_met(result, memory)`
-- `next_trigger(result)`
-
-## 8. 新增 Loop 的开发步骤
+新增普通 loop：
 
 1. 执行 `init loop <name>`
-2. 实现 `BaseLoop` 子类
+2. 新建 `BaseLoop` 子类
 3. 声明 `name`、`description`、`required_tools`
-4. 实现 `plan / execute / verify / report`
-5. 需要长期规则时再补 `loops/<name>.md`
-6. 需要持久状态时实现 memory 抽取钩子
-7. 增加测试
+4. 实现 `plan / execute / verify / fix / report`
+5. 需要通知时实现 `build_notifications`
+6. 需要目标推进时实现 `is_goal_met / next_trigger`
+7. 需要记忆时实现 `extract_memory / extract_goal_memory`
+8. 增加测试
 
-## 9. 边界总结
+新增 agentic loop：
 
-系统边界保持为：
+1. 仍然先实现 `BaseLoop` 子类
+2. 在 `execute()` 或 `fix()` 内调用 `run_agentic_step()`
+3. 为该 step 定义专属 tool schema
+4. tool executor 只登记 effect 或返回内部结果
+5. 由 `LoopEngine` 统一提交 effect、写 record、写 memory
 
-- 显式命令路由在 `main.py`
-- 自然语言交互在 `engine/chat.py + engine/chat_tools.py`
-- goal 创建解析在 `ai_input_resolver.py`（仅 add 命令）
-- 目标存储在 `goals.py`
-- 触发与重试在 `scheduler.py`
-- 单次运行生命周期在 `LoopEngine`
-- 业务实现只在 `loops/*`
-- 外部世界接入只在 `engine/tools/*`
-- memory 读写只通过 `MemoryStore`
+最小形态：
 
-这组边界是当前 runtime 最重要的稳定面。
+```python
+def execute(self, context, ctx):
+    result = run_agentic_step(
+        system_prompt="...",
+        messages=[{"role": "user", "content": "..."}],
+        tools=[...],
+        execute_tool=lambda name, inp: self._execute_tool(name, inp, ctx),
+        run_id=ctx.run_id,
+        metadata={"loop": self.name},
+    )
+    return {"tool_calls": result.tool_calls}
+```
+
+## 13. 边界总结
+
+| 边界 | 稳定规则 |
+|---|---|
+| CLI | 显式命令本地处理，自然语言进 `ChatHarness` |
+| ChatHarness | 只做 CLI 适配，不给 loop 复用 |
+| run_agentic_step | CLI 和 loop 共用的 harness 入口 |
+| HarnessRunner | 只负责 AI tool-use 循环 |
+| LoopEngine | 只负责 run 生命周期 |
+| BaseLoop | 只负责模板方法 |
+| Loop 子类 | 只负责业务逻辑和业务工具 |
+| Effects | 所有外部副作用统一登记、统一提交 |
+| Memory | 状态和偏好通过 MemoryStore 管理 |
+| Records | loop 执行事实进入 run_records，对话进入 conversation_records |
+
+当前最重要的架构判断：
+
+```text
+不要把 LoopEngine 改成 Harness。
+不要让 ChatHarness 进入业务 loop。
+需要 AI 多轮工具调用的 loop，在 execute/fix 内使用 run_agentic_step。
+```

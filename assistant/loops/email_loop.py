@@ -18,6 +18,7 @@ import os
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from engine.agentic_step import run_agentic_step
 from loops.base import BaseLoop
 
 if TYPE_CHECKING:
@@ -317,9 +318,6 @@ action 选项：
     def execute(self, context: dict, ctx: "RunContext | None" = None) -> dict:
         sent, drafted, skipped, failed = [], [], [], []
         memory = context.get("memory", {})
-        preferences = self._resolved_preferences(ctx)
-        behavior_preferences = preferences.get("behavior", {})
-        draft_first = behavior_preferences.get("draft_first", False)
 
         effects = ctx.effects if ctx else None
 
@@ -357,105 +355,13 @@ action 选项：
                         skipped.append(success_item)
                     continue
 
-                # Claude 判断是否需要回复
-                sr = self._should_reply(sender, subject, body, ctx)
-                if not sr.get("need_reply"):
-                    log.info(f"不需要回复: {subject} | {sr.get('reason')}")
-                    success_item = {
-                        "uid": uid,
-                        "subject": subject,
-                        "sender": sender,
-                        "reason": sr.get("reason", ""),
-                        "summary": sr.get("summary", ""),
-                    }
-                    failure_item = dict(success_item)
-                    if effects is not None:
-                        effects.add(
-                            "mark_read",
-                            {"uid": uid},
-                            {
-                                "success_bucket": "skipped",
-                                "success_item": success_item,
-                                "failure_item": failure_item,
-                            },
-                            idempotency_key=self._effect_key(uid, "no_reply_mark_read"),
-                        )
-                    else:
-                        skipped.append(success_item)
-                    continue
-
-                # Maker：生成回复
-                gen = self._generate_reply(uid, sender, subject, body, ctx)
-                reply_text = gen.get("reply", "")
-                risk = gen.get("risk_level", "high")
-                confidence = gen.get("confidence", 0)
-
-                # Checker：验证质量（只修正内容，不改 risk）
-                check = self._verify_reply(sender, subject, body, reply_text, ctx)
-                if not check.get("pass") and confidence >= AUTO_SEND_CONFIDENCE:
-                    gen2 = self._generate_reply(uid, sender, subject,
-                                                body + f"\n[上次回复问题：{check.get('issues')}]", ctx)
-                    reply_text = gen2.get("reply", reply_text)
-
-                auto_send = os.environ.get("EMAIL_AUTO_SEND", "false").lower() == "true"
-                if draft_first:
-                    auto_send = False
-                if auto_send and risk == "low" and confidence >= AUTO_SEND_CONFIDENCE:
-                    success_item = {
-                        "uid": uid,
-                        "subject": subject,
-                        "sender": sender,
-                        "reply": reply_text,
-                    }
-                    failure_item = {
-                        "uid": uid,
-                        "subject": subject,
-                        "sender": sender,
-                    }
-                    if effects is not None:
-                        effects.add(
-                            "send_email_and_mark_read",
-                            {"uid": uid, "to": sender, "subject": subject, "body": reply_text},
-                            {
-                                "success_bucket": "sent",
-                                "success_item": success_item,
-                                "failure_item": failure_item,
-                            },
-                            idempotency_key=self._effect_key(uid, "send_reply"),
-                        )
-                    else:
-                        sent.append(success_item)
-                else:
-                    reason = gen.get("risk_reason", "") or f"risk={risk} conf={confidence}"
-                    if not auto_send:
-                        reason = f"[自动发送已关闭] {reason}".strip()
-                    if draft_first:
-                        reason = f"[已按偏好优先存草稿] {reason}".strip()
-                    success_item = {
-                        "uid": uid,
-                        "subject": subject,
-                        "sender": sender,
-                        "reason": reason,
-                    }
-                    failure_item = {
-                        "uid": uid,
-                        "subject": subject,
-                        "sender": sender,
-                        "reason": reason,
-                    }
-                    if effects is not None:
-                        effects.add(
-                            "save_draft_and_mark_read",
-                            {"uid": uid, "to": sender, "subject": subject, "body": reply_text},
-                            {
-                                "success_bucket": "drafted",
-                                "success_item": success_item,
-                                "failure_item": failure_item,
-                            },
-                            idempotency_key=self._effect_key(uid, "save_draft"),
-                        )
-                    else:
-                        drafted.append(success_item)
+                self._process_email_with_harness(
+                    email=em,
+                    ctx=ctx,
+                    sent=sent,
+                    drafted=drafted,
+                    skipped=skipped,
+                )
             except Exception as e:
                 log.error(f"处理邮件失败 uid={uid}: {e}")
                 failed.append({"uid": uid, "subject": em.get("subject", ""),
@@ -463,6 +369,240 @@ action 选项：
 
         return {"sent": sent, "drafted": drafted, "skipped": skipped, "failed": failed,
                 "unread_count": 0}
+
+    def _process_email_with_harness(
+        self,
+        *,
+        email: dict,
+        ctx: "RunContext | None",
+        sent: list[dict],
+        drafted: list[dict],
+        skipped: list[dict],
+    ) -> None:
+        uid, sender, subject, body = email["uid"], email["sender"], email["subject"], email["body"]
+        tools = self._email_tool_schemas(ctx)
+
+        result = run_agentic_step(
+            system_prompt=self._build_email_agent_prompt(ctx),
+            messages=[{
+                "role": "user",
+                "content": self._build_email_agent_message(sender, subject, body),
+            }],
+            tools=tools,
+            execute_tool=lambda name, tool_input: self._execute_email_agent_tool(
+                name,
+                tool_input,
+                email=email,
+                ctx=ctx,
+                sent=sent,
+                drafted=drafted,
+                skipped=skipped,
+            ),
+            run_id=getattr(ctx, "run_id", "") if ctx else "",
+            metadata={
+                "loop": self.name,
+                "uid": uid,
+                "sender": sender,
+                "subject": subject,
+            },
+            direct_tools={tool["name"] for tool in tools},
+            max_iterations=4,
+        )
+        if not result.tool_calls:
+            raise RuntimeError("邮件 agent 未选择任何处理动作")
+
+    def _build_email_agent_prompt(self, ctx: "RunContext | None") -> str:
+        preferences = self._resolved_preferences(ctx)
+        behavior_preferences = preferences.get("behavior", {})
+        draft_first = bool(behavior_preferences.get("draft_first", False))
+        auto_send = os.environ.get("EMAIL_AUTO_SEND", "false").lower() == "true"
+        if draft_first:
+            auto_send = False
+
+        policy = [
+            "你是邮件处理 agent。你必须且只能调用一个工具完成当前邮件处理。",
+            "可选动作：无需回复则调用 skip_email；需要人工确认则调用 save_draft；只有明确安全时才调用 send_reply。",
+            "系统通知、营销订阅、账单提醒、退信、noreply 类邮件通常 skip_email。",
+            "真人问询、会议邀请、合作请求、审批事项通常需要回复。",
+            "回复必须简洁、礼貌、具体，不超过 200 字。",
+            "不要做金额、合同、法律或敏感承诺；这类邮件必须 save_draft。",
+            f"自动发送开关：{'开启' if auto_send else '关闭'}。",
+            f"自动发送置信度阈值：{AUTO_SEND_CONFIDENCE}。",
+        ]
+        if not auto_send:
+            policy.append("自动发送关闭时，即使你生成了回复，也必须调用 save_draft，不能调用 send_reply。")
+        if draft_first:
+            policy.append("用户偏好要求优先存草稿，必须调用 save_draft，不能调用 send_reply。")
+        if ctx and ctx.loop_doc:
+            policy.append(f"\nLoop 规则文档：\n{ctx.loop_doc}")
+        return "\n".join(policy)
+
+    @staticmethod
+    def _build_email_agent_message(sender: str, subject: str, body: str) -> str:
+        return (
+            f"发件人：{sender}\n"
+            f"主题：{subject}\n"
+            f"正文：{body[:BODY_LIMIT_FOR_CLAUDE]}"
+        )
+
+    def _email_tool_schemas(self, ctx: "RunContext | None" = None) -> list[dict]:
+        preferences = self._resolved_preferences(ctx)
+        behavior_preferences = preferences.get("behavior", {})
+        if not isinstance(behavior_preferences, dict):
+            behavior_preferences = {}
+        draft_first = bool(behavior_preferences.get("draft_first", False))
+        auto_send = os.environ.get("EMAIL_AUTO_SEND", "false").lower() == "true" and not draft_first
+
+        tools = [
+            {
+                "name": "skip_email",
+                "description": "标记当前邮件为已读并跳过，不生成回复。",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string"},
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["reason"],
+                },
+            },
+            {
+                "name": "save_draft",
+                "description": "保存回复草稿并标记当前邮件已读，适合需要人工确认或自动发送关闭的邮件。",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reply": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "confidence": {"type": "integer"},
+                    },
+                    "required": ["reply", "reason"],
+                },
+            },
+        ]
+        if auto_send:
+            tools.append({
+                "name": "send_reply",
+                "description": "直接发送回复并标记当前邮件已读。只用于低风险且置信度足够高的邮件。",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reply": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "confidence": {"type": "integer"},
+                    },
+                    "required": ["reply", "reason", "confidence"],
+                },
+            })
+        return tools
+
+    def _execute_email_agent_tool(
+        self,
+        name: str,
+        tool_input: dict,
+        *,
+        email: dict,
+        ctx: "RunContext | None",
+        sent: list[dict],
+        drafted: list[dict],
+        skipped: list[dict],
+    ) -> str:
+        uid, sender, subject = email["uid"], email["sender"], email["subject"]
+        effects = ctx.effects if ctx else None
+
+        if name == "skip_email":
+            reason = tool_input.get("reason", "")
+            success_item = {
+                "uid": uid,
+                "subject": subject,
+                "sender": sender,
+                "reason": reason,
+                "summary": tool_input.get("summary", ""),
+            }
+            if effects is not None:
+                effects.add(
+                    "mark_read",
+                    {"uid": uid},
+                    {
+                        "success_bucket": "skipped",
+                        "success_item": success_item,
+                        "failure_item": dict(success_item),
+                    },
+                    idempotency_key=self._effect_key(uid, "agent_skip_mark_read"),
+                )
+            else:
+                skipped.append(success_item)
+            return f"已登记跳过邮件：{subject}"
+
+        if name == "save_draft":
+            reply = tool_input.get("reply", "")
+            reason = tool_input.get("reason", "")
+            success_item = {
+                "uid": uid,
+                "subject": subject,
+                "sender": sender,
+                "reason": reason,
+            }
+            failure_item = dict(success_item)
+            if effects is not None:
+                effects.add(
+                    "save_draft_and_mark_read",
+                    {"uid": uid, "to": sender, "subject": subject, "body": reply},
+                    {
+                        "success_bucket": "drafted",
+                        "success_item": success_item,
+                        "failure_item": failure_item,
+                    },
+                    idempotency_key=self._effect_key(uid, "agent_save_draft"),
+                )
+            else:
+                drafted.append(success_item)
+            return f"已登记保存草稿：{subject}"
+
+        if name == "send_reply":
+            confidence = int(tool_input.get("confidence", 0) or 0)
+            if confidence < AUTO_SEND_CONFIDENCE:
+                return self._execute_email_agent_tool(
+                    "save_draft",
+                    {
+                        "reply": tool_input.get("reply", ""),
+                        "reason": f"置信度不足，已改存草稿：{tool_input.get('reason', '')}",
+                        "confidence": confidence,
+                    },
+                    email=email,
+                    ctx=ctx,
+                    sent=sent,
+                    drafted=drafted,
+                    skipped=skipped,
+                )
+            reply = tool_input.get("reply", "")
+            success_item = {
+                "uid": uid,
+                "subject": subject,
+                "sender": sender,
+                "reply": reply,
+            }
+            failure_item = {
+                "uid": uid,
+                "subject": subject,
+                "sender": sender,
+            }
+            if effects is not None:
+                effects.add(
+                    "send_email_and_mark_read",
+                    {"uid": uid, "to": sender, "subject": subject, "body": reply},
+                    {
+                        "success_bucket": "sent",
+                        "success_item": success_item,
+                        "failure_item": failure_item,
+                    },
+                    idempotency_key=self._effect_key(uid, "agent_send_reply"),
+                )
+            else:
+                sent.append(success_item)
+            return f"已登记发送回复：{subject}"
+
+        raise ValueError(f"未知邮件 agent tool: {name}")
 
     def verify(self, result: dict) -> tuple[bool, str]:
         failed = result.get("failed", [])

@@ -12,8 +12,9 @@ Loop 基类。
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from engine.context import RunContext
@@ -21,6 +22,16 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 MAX_RETRIES = 2
+
+CommitEffects = Callable[["BaseLoop", "RunContext", dict, dict], dict]
+
+
+@dataclass
+class LoopRunOnceResult:
+    result: dict
+    summary: str
+    phase_data: dict
+    success: bool
 
 
 class BaseLoop(ABC):
@@ -36,47 +47,104 @@ class BaseLoop(ABC):
         if not cls.description:
             raise TypeError(f"{cls.__name__} 必须声明 description 类属性")
 
-    # ── 主执行入口（兼容旧调用，新代码走 LoopEngine.run）───
+    # ── 模板方法入口 ─────────────────────────────────────
 
-    def run(self, goal: dict) -> str:
-        """直接执行，不经过 Engine（兼容旧 scheduler 和测试）。"""
-        log.info(f"[{self.name}] 开始执行 | goal={goal['id']}")
+    def run_once(
+        self,
+        goal: dict,
+        ctx: "RunContext",
+        *,
+        commit_effects: CommitEffects | None = None,
+        max_retries: int = MAX_RETRIES,
+    ) -> LoopRunOnceResult:
+        """
+        模板方法：固定单次 loop 闭环，子类只覆写各阶段钩子。
+
+        Harness 不属于这个骨架；如果某个 loop 需要 AI 多轮工具调用，
+        应在 execute/fix 内显式调用 HarnessRunner。
+        """
+        phase_data = {
+            "plan": {"ok": False, "error": None},
+            "execute": {"ok": False, "error": None},
+            "effects": {"planned": [], "attempts": [], "dry_run": bool(goal.get("dry_run", False))},
+            "verify": {"attempts": []},
+            "report": {"ok": False, "error": None},
+            "runtime": {"type": "loop_template"},
+        }
 
         try:
-            context = self.plan(goal)
+            context = self.plan(goal, ctx)
+            phase_data["plan"]["ok"] = True
+            phase_data["plan"]["context_keys"] = sorted(context.keys())
         except Exception as e:
             msg = f"规划阶段失败: {e}"
             log.error(f"[{self.name}] {msg}")
-            return msg
+            phase_data["plan"]["error"] = str(e)
+            return LoopRunOnceResult({}, msg, phase_data, False)
 
         try:
-            result = self.execute(context)
+            result = self.execute(context, ctx)
+            phase_data["execute"]["mode"] = "loop_template"
+            phase_data["execute"]["ok"] = True
+            phase_data["execute"]["result_keys"] = sorted(result.keys())
         except Exception as e:
             msg = f"执行阶段失败: {e}"
             log.error(f"[{self.name}] {msg}")
-            return msg
+            phase_data["execute"]["error"] = str(e)
+            return LoopRunOnceResult({}, msg, phase_data, False)
 
-        for attempt in range(MAX_RETRIES + 1):
+        result = self._settle_effects(ctx, result, phase_data, commit_effects)
+
+        for attempt in range(max_retries + 1):
             try:
                 ok, issues = self.verify(result)
+                phase_data["verify"]["attempts"].append({
+                    "attempt": attempt + 1,
+                    "ok": ok,
+                    "issues": issues,
+                })
             except Exception as e:
                 log.warning(f"[{self.name}] 验证异常（跳过）: {e}")
+                phase_data["verify"]["attempts"].append({
+                    "attempt": attempt + 1,
+                    "ok": True,
+                    "issues": f"verify skipped: {e}",
+                })
                 break
             if ok:
                 break
             log.info(f"[{self.name}] 验证失败 attempt={attempt + 1}: {issues}")
-            if attempt < MAX_RETRIES:
+            if attempt < max_retries:
                 try:
-                    result = self.fix(result, issues)
+                    result = self.fix(result, issues, ctx)
+                    result = self._settle_effects(ctx, result, phase_data, commit_effects)
+                    phase_data["verify"]["attempts"][-1]["fixed"] = True
                 except Exception as e:
                     log.error(f"[{self.name}] 修复失败: {e}")
+                    phase_data["verify"]["attempts"][-1]["fix_error"] = str(e)
                     break
             else:
                 log.warning(f"[{self.name}] 重试耗尽，使用最后结果")
 
-        summary = self.report(result)
-        log.info(f"[{self.name}] 完成 | {summary}")
-        return summary
+        try:
+            summary = self.report(result)
+            phase_data["report"]["ok"] = True
+        except Exception as e:
+            summary = f"汇报阶段失败: {e}"
+            phase_data["report"]["error"] = str(e)
+            return LoopRunOnceResult(result, summary, phase_data, False)
+        return LoopRunOnceResult(result, summary, phase_data, True)
+
+    def _settle_effects(
+        self,
+        ctx: "RunContext",
+        result: dict,
+        phase_data: dict,
+        commit_effects: CommitEffects | None,
+    ) -> dict:
+        if commit_effects:
+            result = commit_effects(self, ctx, result, phase_data)
+        return self.after_effects(result, ctx)
 
     # ── 子类必须实现 ─────────────────────────────────────
 

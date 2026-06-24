@@ -1,8 +1,12 @@
 """
-LoopEngine — 统一执行引擎。
+LoopEngine — Loop Engineering runtime。
 
-接管通知、记忆读写、运行记录、目标判断、动态重调度。
-Loop 实现只负责业务逻辑，report() 只返回字符串。
+LoopEngine 负责目标型任务的一次运行生命周期：
+上下文、调用 loop 模板方法、effects、通知、记忆、运行记录、目标判断、动态重调度。
+
+注意：这里不是 Harness。
+Harness 的核心是 AI -> tool_use -> tool_result 的 agentic 循环；
+LoopEngine 的核心是 goal -> plan -> execute -> verify -> memory/reschedule 的目标推进循环。
 """
 
 import logging
@@ -12,16 +16,15 @@ from time import perf_counter
 import os
 import tempfile
 import uuid
-from pathlib import Path
 
-from engine.context import RunContext, ToolRegistry
+from engine.context import RunContext
 from engine.effects import Effect, EffectHistoryStore
 from engine.memory import MemoryStore
 from engine.records import RunRecord, RunRecorder
+from engine.runtime_context import build_loop_run_context
 
 log = logging.getLogger(__name__)
 
-MAX_RETRIES = 2
 RECENT_RUNS_LIMIT = 5
 
 
@@ -43,16 +46,6 @@ class LoopEngine:
         self.recorder = recorder or RunRecorder()
         self.effect_history = EffectHistoryStore()
 
-    @staticmethod
-    def _read_optional_doc(path: Path) -> str:
-        if not path.exists():
-            return ""
-        try:
-            return path.read_text(encoding="utf-8").strip()
-        except Exception as e:
-            log.warning(f"[engine] 文档加载失败 path={path.name}: {e}")
-            return ""
-
     # ── 主入口 ───────────────────────────────────────────
 
     def run(self, loop, goal: dict) -> RunResult:
@@ -62,51 +55,48 @@ class LoopEngine:
         loop_name = loop.name
         log.info(f"[engine] 开始执行 loop={loop_name} goal={goal['id']} run={run_id}")
 
-        # 1. 加载记忆
-        memory = self.memory.load_loop_memory(loop_name)
-        goal_memory = self.memory.load_goal_memory(goal["id"])
-        assistant_dir = Path(__file__).resolve().parent.parent
-        runtime_doc = self._read_optional_doc(assistant_dir / "RUNTIME.md")
-        loop_doc = self._read_optional_doc(assistant_dir / "loops" / f"{loop_name}.md")
-        recent_runs = {
-            "goal_recent_runs": self.recorder.list_recent_by_goal(goal["id"], limit=RECENT_RUNS_LIMIT),
-            "loop_recent_runs": self.recorder.list_recent_by_loop(loop_name, limit=RECENT_RUNS_LIMIT),
-        }
-
-        # 2. 构建 RunContext，注入工具
-        ctx = RunContext(
-            run_id=run_id,
+        # 1. 构建 run 级上下文。
+        # 这一步已经抽到 runtime_context 中，避免 loop / chat 各自重复装配 memory / docs / recent records / tools。
+        ctx = build_loop_run_context(
+            memory_store=self.memory,
+            recorder=self.recorder,
+            loop=loop,
             goal=goal,
-            memory=memory,
-            goal_memory=goal_memory,
-            recent_runs=recent_runs,
-            runtime_doc=runtime_doc,
-            loop_doc=loop_doc,
-            tools=ToolRegistry.build(getattr(loop, "required_tools", [])),
+            run_id=run_id,
         )
         dry_run = bool(goal.get("dry_run", False))
 
-        # 3. 执行五阶段
-        result, summary, phase_data, success = self._run_phases(loop, goal, ctx)
+        memory = ctx.memory
+        goal_memory = ctx.goal_memory
 
-        # 4. 统一通知（从 report 里剥离）
-        notifications = self._notify(loop, result, summary, ctx)
+        # 2. 调用 BaseLoop 模板方法推进单次 loop 闭环。
+        # 如果某个 loop 内部需要 AI 多轮工具调用，应由该 loop 在 execute/fix 中显式使用 HarnessRunner。
+        result, summary, phase_data, success = self._execute_loop_template(loop, goal, ctx)
 
-        # 5. 沉淀记忆
-        new_memory = loop.extract_memory(result, memory)
-        self.memory.save_loop_memory(loop_name, new_memory)
-        new_goal_memory = self._extract_goal_memory(
-            loop,
-            result,
-            goal_memory,
-            summary=summary,
-            success=success,
-            run_id=run_id,
-        )
-        self.memory.save_goal_memory(goal["id"], new_goal_memory)
+        notifications: list[dict] = []
+        new_memory = memory
+        new_goal_memory = goal_memory
+        next_trigger_in_seconds = None
 
-        # 6. 目标驱动：判断是否需要重触发
-        next_trigger_in_seconds = self._maybe_reschedule(loop, goal, result, new_memory)
+        if success:
+            # 3. 统一通知（从 report 里剥离）
+            notifications = self._notify(loop, result, summary, ctx)
+
+            # 4. 沉淀记忆
+            new_memory = loop.extract_memory(result, memory)
+            self.memory.save_loop_memory(loop_name, new_memory)
+            new_goal_memory = self._extract_goal_memory(
+                loop,
+                result,
+                goal_memory,
+                summary=summary,
+                success=success,
+                run_id=run_id,
+            )
+            self.memory.save_goal_memory(goal["id"], new_goal_memory)
+
+            # 5. 目标驱动：判断是否需要重触发
+            next_trigger_in_seconds = self._maybe_reschedule(loop, goal, result, new_memory)
 
         ended_at = datetime.now(timezone.utc)
         duration_ms = int((perf_counter() - started_clock) * 1000)
@@ -138,83 +128,20 @@ class LoopEngine:
         log.info(f"[engine] 完成 loop={loop_name} | {summary} | record={record_path.name}")
         return RunResult(summary=summary, result=result, record=record, success=success)
 
-    # ── 内部阶段执行 ─────────────────────────────────────
+    # ── Loop 模板方法 ─────────────────────────────────────
 
-    def _run_phases(self, loop, goal: dict, ctx: RunContext) -> tuple[dict, str, dict, bool]:
-        phase_data = {
-            "plan": {"ok": False, "error": None},
-            "execute": {"ok": False, "error": None},
-            "effects": {"planned": [], "attempts": [], "dry_run": bool(goal.get("dry_run", False))},
-            "verify": {"attempts": []},
-            "report": {"ok": False, "error": None},
-        }
-
-        # plan
-        try:
-            context = loop.plan(goal, ctx)
-            phase_data["plan"]["ok"] = True
-            phase_data["plan"]["context_keys"] = sorted(context.keys())
-        except Exception as e:
-            msg = f"规划阶段失败: {e}"
-            log.error(f"[engine:{loop.name}] {msg}")
-            phase_data["plan"]["error"] = str(e)
-            return {}, msg, phase_data, False
-
-        # execute
-        try:
-            result = loop.execute(context, ctx)
-            phase_data["execute"]["ok"] = True
-            phase_data["execute"]["result_keys"] = sorted(result.keys())
-        except Exception as e:
-            msg = f"执行阶段失败: {e}"
-            log.error(f"[engine:{loop.name}] {msg}")
-            phase_data["execute"]["error"] = str(e)
-            return {}, msg, phase_data, False
-
-        result = self._commit_effects(loop, ctx, result, phase_data)
-        result = loop.after_effects(result, ctx)
-
-        # verify + fix
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                ok, issues = loop.verify(result)
-                phase_data["verify"]["attempts"].append({
-                    "attempt": attempt + 1,
-                    "ok": ok,
-                    "issues": issues,
-                })
-            except Exception as e:
-                log.warning(f"[engine:{loop.name}] 验证异常（跳过）: {e}")
-                phase_data["verify"]["attempts"].append({
-                    "attempt": attempt + 1,
-                    "ok": True,
-                    "issues": f"verify skipped: {e}",
-                })
-                break
-            if ok:
-                break
-            log.info(f"[engine:{loop.name}] 验证失败 attempt={attempt + 1}: {issues}")
-            if attempt < MAX_RETRIES:
-                try:
-                    result = loop.fix(result, issues, ctx)
-                    result = self._commit_effects(loop, ctx, result, phase_data)
-                    result = loop.after_effects(result, ctx)
-                    phase_data["verify"]["attempts"][-1]["fixed"] = True
-                except Exception as e:
-                    log.error(f"[engine:{loop.name}] 修复失败: {e}")
-                    phase_data["verify"]["attempts"][-1]["fix_error"] = str(e)
-                    break
-            else:
-                log.warning(f"[engine:{loop.name}] 重试耗尽，使用最后结果")
-
-        try:
-            summary = loop.report(result)
-            phase_data["report"]["ok"] = True
-        except Exception as e:
-            summary = f"汇报阶段失败: {e}"
-            phase_data["report"]["error"] = str(e)
-            return result, summary, phase_data, False
-        return result, summary, phase_data, True
+    def _execute_loop_template(self, loop, goal: dict, ctx: RunContext) -> tuple[dict, str, dict, bool]:
+        run_result = loop.run_once(
+            goal,
+            ctx,
+            commit_effects=self._commit_effects,
+        )
+        return (
+            run_result.result,
+            run_result.summary,
+            run_result.phase_data,
+            run_result.success,
+        )
 
     # ── 通知 ─────────────────────────────────────────────
 
