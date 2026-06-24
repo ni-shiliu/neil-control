@@ -76,6 +76,12 @@ class DailyBriefingLoop(BaseLoop):
     def _queue_delivery_effect(self, result: dict, today: str, ctx: "RunContext | None" = None) -> None:
         if not ctx:
             return
+        preferences = self._resolved_preferences(ctx)
+        delivery_channels = preferences.get("delivery", {}).get("channels", [])
+        if isinstance(delivery_channels, list) and delivery_channels:
+            normalized_channels = {str(channel).strip().lower() for channel in delivery_channels if str(channel).strip()}
+            if normalized_channels.isdisjoint({"telegram", "telegram_document"}):
+                return
         output = next(
             (a for a in result.get("outputs", []) if a.get("output_type") == "briefing_html"),
             None,
@@ -323,6 +329,9 @@ class DailyBriefingLoop(BaseLoop):
         """单独生成每日英文模块 HTML 片段，确保不被遗漏。"""
         banned_phrases = self._collect_recent_english_phrases(ctx)
         banned_lines = "\n".join(f"- {phrase}" for phrase in banned_phrases[:20])
+        preferences = self._resolved_preferences(ctx)
+        english_style = preferences.get("format", {}).get("english_phrase_style", "")
+        english_extra = f"\n补充风格偏好：{english_style}" if english_style else ""
         result = self._call_claude(f"""今天是 {today}。
 
 请生成一个「每日英文」HTML 模块片段（不需要完整 HTML 文档，只需要一个 <section> 或 <div>）。
@@ -339,6 +348,7 @@ class DailyBriefingLoop(BaseLoop):
 {banned_lines}
 - 优先选择更自然、具体、像真人会说的话
 - 职场和生活场景都可以，但不要总是会议/跟进类表达
+{english_extra}
 
 样式要求：
 - 内联样式，背景色用渐变或亮色突出显示
@@ -352,6 +362,27 @@ class DailyBriefingLoop(BaseLoop):
             parts = result.split("```")
             result = parts[1].lstrip("html").strip() if len(parts) > 1 else result
         return result
+
+    @staticmethod
+    def _merge_preferences(base: dict, overrides: dict) -> dict:
+        merged = dict(base)
+        for key, value in overrides.items():
+            if isinstance(merged.get(key), dict) and isinstance(value, dict):
+                merged[key] = DailyBriefingLoop._merge_preferences(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _resolved_preferences(self, ctx: "RunContext | None" = None) -> dict:
+        if not ctx:
+            return {}
+        loop_preferences = ctx.memory.get("preferences", {})
+        goal_preferences = ctx.goal_memory.get("preferences", {})
+        if not isinstance(loop_preferences, dict):
+            loop_preferences = {}
+        if not isinstance(goal_preferences, dict):
+            goal_preferences = {}
+        return self._merge_preferences(loop_preferences, goal_preferences)
 
     def _collect_recent_english_phrases(self, ctx: "RunContext | None" = None) -> list[str]:
         phrases: list[str] = []
@@ -418,6 +449,12 @@ class DailyBriefingLoop(BaseLoop):
         github = context["github"]
         hn = context["hackernews"]
         kr = context["36kr"]
+        preferences = self._resolved_preferences(ctx)
+        topic_bias = preferences.get("content", {}).get("topic_bias", [])
+        extra_sections = preferences.get("content", {}).get("extra_sections", [])
+        title_lang = preferences.get("format", {}).get("title_lang", "")
+        body_lang = preferences.get("format", {}).get("body_lang", "")
+        include_english_phrase = preferences.get("content", {}).get("include_english_phrase", True)
 
         # 找今日重点的 URL，传给 Claude 强制使用
         top_url = self._find_top_story_url(toutiao, hn, github)
@@ -443,6 +480,13 @@ class DailyBriefingLoop(BaseLoop):
 【36kr 快讯】
 {json.dumps(kr, ensure_ascii=False, indent=2)}
 
+【用户偏好】
+topic_bias={json.dumps(topic_bias, ensure_ascii=False)}
+extra_sections={json.dumps(extra_sections, ensure_ascii=False)}
+title_lang={title_lang or "auto"}
+body_lang={body_lang or "auto"}
+include_english_phrase={json.dumps(include_english_phrase, ensure_ascii=False)}
+
 ---
 
 生成要求：
@@ -461,6 +505,12 @@ class DailyBriefingLoop(BaseLoop):
 6. Hacker News 精选 — 选3-5条，每条标题加 <a href="url" target="_blank"> 链接
 7. 36kr 快讯 — 选3-5条，每条标题加 <a href="url" target="_blank"> 链接
 8. 今日一问 — 根据热点提一个有意思的问题
+
+偏好要求：
+- 如果 topic_bias 非空，优先提高这些主题的权重，但不要脱离当天真实数据乱编内容
+- 如果 title_lang=英文，则大标题和主要板块标题优先英文或中英混排
+- 如果 body_lang=中文，则正文保持中文为主
+- 如果 extra_sections 非空，可以择优增加 1 个附加板块
 
 注意：不需要生成每日英文板块，会单独插入。
 HTML 末尾留一个注释占位：<!-- ENGLISH_BLOCK -->
@@ -482,8 +532,11 @@ HTML 末尾留一个注释占位：<!-- ENGLISH_BLOCK -->
 
         # ── 第二步：单独生成每日英文，强制插入 ───────────────
         log.info("生成每日英文模块...")
-        english_block = self._generate_english_block(today, ctx=ctx)
-        english_phrase = self._extract_english_phrase(english_block)
+        english_block = ""
+        english_phrase = ""
+        if include_english_phrase is not False:
+            english_block = self._generate_english_block(today, ctx=ctx)
+            english_phrase = self._extract_english_phrase(english_block)
 
         # 插入到 </body> 前，如果有占位注释就替换，否则直接插入
         if "<!-- ENGLISH_BLOCK -->" in html:

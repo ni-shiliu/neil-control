@@ -33,6 +33,7 @@ assistant/goals.json
 assistant/assistant.log
 assistant/effect_history.json
 assistant/run_records/
+assistant/conversation_records/
 assistant/.cli_history
 assistant/RUNTIME.md
 assistant/memory/*.json

@@ -109,6 +109,30 @@ def resume(goal_id: str) -> bool:
     return _set_status(goal_id, "active")
 
 
+def pause_all() -> int:
+    goals = load()
+    changed = 0
+    for goal in goals:
+        if goal.get("status") != "paused":
+            goal["status"] = "paused"
+            changed += 1
+    if changed:
+        save(goals)
+    return changed
+
+
+def resume_all() -> int:
+    goals = load()
+    changed = 0
+    for goal in goals:
+        if goal.get("status") != "active":
+            goal["status"] = "active"
+            changed += 1
+    if changed:
+        save(goals)
+    return changed
+
+
 def update_last_run(goal_id: str, result: str, meta: dict | None = None) -> None:
     goals = load()
     for g in goals:

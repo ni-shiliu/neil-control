@@ -1,9 +1,10 @@
 """
 MemoryStore — 持久化 Loop 的跨 run 记忆。
 
-当前支持两层：
+当前支持三层：
 - loop memory：跨 goal 的长期经验
 - goal memory：某个 goal 专属的运行状态
+- user memory：用户级长期偏好（CLI 交互写入，仅放偏好不放记录）
 
 兼容旧接口：
 - load/save 仍默认操作 loop memory
@@ -11,6 +12,7 @@ MemoryStore — 持久化 Loop 的跨 run 记忆。
 
 import json
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -18,6 +20,7 @@ log = logging.getLogger(__name__)
 _BASE_DIR = Path(__file__).parent.parent / "memory"
 GOAL_MEMORY_MAX_BYTES = 8 * 1024
 LOOP_MEMORY_MAX_BYTES = 16 * 1024
+USER_MEMORY_MAX_BYTES = 8 * 1024
 DEFAULT_RECENT_LIMIT = 5
 DEFAULT_PATTERN_LIMIT = 50
 DEFAULT_TEXT_LIMIT = 240
@@ -30,8 +33,10 @@ class MemoryStore:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.loop_dir = self.base_dir / "loops"
         self.goal_dir = self.base_dir / "goals"
+        self.user_dir = self.base_dir / "user"
         self.loop_dir.mkdir(parents=True, exist_ok=True)
         self.goal_dir.mkdir(parents=True, exist_ok=True)
+        self.user_dir.mkdir(parents=True, exist_ok=True)
 
     def _loop_path(self, loop_name: str) -> Path:
         return self.loop_dir / f"{loop_name}.json"
@@ -39,9 +44,25 @@ class MemoryStore:
     def _goal_path(self, goal_id: str) -> Path:
         return self.goal_dir / f"{goal_id}.json"
 
+    def _user_path(self) -> Path:
+        return self.user_dir / "user.json"
+
     @staticmethod
     def _json_size(data: dict) -> int:
         return len(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    @classmethod
+    def _deep_merge(cls, base, updates):
+        if not isinstance(base, dict) or not isinstance(updates, dict):
+            return deepcopy(updates)
+
+        merged = deepcopy(base)
+        for key, value in updates.items():
+            if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+                merged[key] = cls._deep_merge(merged[key], value)
+            else:
+                merged[key] = deepcopy(value)
+        return merged
 
     @staticmethod
     def _trim_text(value, limit: int = DEFAULT_TEXT_LIMIT):
@@ -187,6 +208,23 @@ class MemoryStore:
             minimal["skip_patterns"] = minimal["skip_patterns"][-10:]
         return minimal
 
+    @classmethod
+    def _compact_user_memory(cls, data: dict) -> dict:
+        """user memory 只放偏好，不做列表截断，仅做文本压缩和大小保护。"""
+        compacted = {}
+        for key, value in data.items():
+            if value in (None, "", [], {}):
+                continue
+            compacted[key] = cls._trim_value(value)
+        if cls._json_size(compacted) <= USER_MEMORY_MAX_BYTES:
+            return compacted
+        # 超限时只保留 preferences 和 goal_nicknames
+        return {
+            k: compacted[k]
+            for k in ("preferences", "goal_nicknames")
+            if k in compacted and compacted[k] not in (None, "", {})
+        }
+
     @staticmethod
     def _load_path(path: Path, label: str) -> dict:
         if not path.exists():
@@ -235,8 +273,37 @@ class MemoryStore:
     def merge_save(self, loop_name: str, updates: dict) -> dict:
         """把 updates merge 进现有记忆并保存，返回合并后的完整记忆。"""
         current = self.load_loop_memory(loop_name)
-        merged = {**current, **updates}
+        merged = self._deep_merge(current, updates)
         self.save_loop_memory(loop_name, merged)
+        return merged
+
+    def merge_save_loop_memory(self, loop_name: str, updates: dict) -> dict:
+        current = self.load_loop_memory(loop_name)
+        merged = self._deep_merge(current, updates)
+        self.save_loop_memory(loop_name, merged)
+        return merged
+
+    def merge_save_goal_memory(self, goal_id: str, updates: dict) -> dict:
+        current = self.load_goal_memory(goal_id)
+        merged = self._deep_merge(current, updates)
+        self.save_goal_memory(goal_id, merged)
+        return merged
+
+    def load_user_memory(self) -> dict:
+        return self._load_path(self._user_path(), "user")
+
+    def save_user_memory(self, data: dict) -> None:
+        compacted = self._compact_user_memory(data)
+        before_size = self._json_size(data) if isinstance(data, dict) else 0
+        after_size = self._json_size(compacted)
+        if after_size < before_size:
+            log.info(f"[memory] user compacted bytes={before_size}->{after_size}")
+        self._save_path(self._user_path(), "user", compacted)
+
+    def merge_save_user_memory(self, updates: dict) -> dict:
+        current = self.load_user_memory()
+        merged = self._deep_merge(current, updates)
+        self.save_user_memory(merged)
         return merged
 
     def append_list(self, loop_name: str, key: str, item: dict, max_size: int = 100) -> None:

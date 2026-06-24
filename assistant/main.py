@@ -8,11 +8,15 @@
 import json
 import logging
 import shlex
+import io
 import sys
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 
+from conversation_records import ConversationRecorder
+from engine.chat import ChatHarness
 from dotenv import load_dotenv
-from claude_client import get_client, get_model
 try:
     from prompt_toolkit import prompt as pt_prompt
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -39,7 +43,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler(Path(__file__).parent / "assistant.log"),
-        logging.StreamHandler(),
     ],
 )
 log = logging.getLogger(__name__)
@@ -49,12 +52,29 @@ logging.getLogger("anthropic").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 _recorder = RunRecorder()
 _memory = MemoryStore()
+_conversation_recorder = ConversationRecorder()
+_chat_harness = ChatHarness(memory=_memory, conversation_recorder=_conversation_recorder)
 _ASSISTANT_DIR = Path(__file__).parent
 _LOOPS_DIR = _ASSISTANT_DIR / "loops"
 _TESTS_DIR = _ASSISTANT_DIR / "tests"
 _RUNTIME_DOC = _ASSISTANT_DIR / "RUNTIME.md"
 _CLI_HISTORY = _ASSISTANT_DIR / ".cli_history"
 _BANNER_FILE = _ASSISTANT_DIR / "BANNER.txt"
+_PREFERENCE_BUCKETS = {"content", "delivery", "behavior", "format"}
+
+
+class _TeeStdout:
+    def __init__(self, *targets):
+        self.targets = targets
+
+    def write(self, text: str) -> int:
+        for target in self.targets:
+            target.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        for target in self.targets:
+            target.flush()
 
 
 def _format_effect_statuses(effects: list[dict]) -> str:
@@ -85,8 +105,36 @@ def _current_loop_names() -> list[str]:
     return sorted(discover().keys())
 
 
-def _normalize_text(text: str) -> str:
+def _recent_conversations(limit: int = 10) -> list[dict]:
+    return _conversation_recorder.list_recent(limit=limit)
+
+
+def _normalize_lookup_text(text: str) -> str:
     return "".join(ch.lower() for ch in text.strip() if not ch.isspace())
+
+
+def _flatten_preference_keys(data: dict, prefix: str = "") -> list[str]:
+    keys: list[str] = []
+    for key, value in data.items():
+        current = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict) and value:
+            keys.extend(_flatten_preference_keys(value, current))
+        else:
+            keys.append(current)
+    return keys
+
+
+def _sanitize_preferences(preferences: dict | None) -> dict | None:
+    if not isinstance(preferences, dict):
+        return None
+
+    sanitized: dict = {}
+    for key, value in preferences.items():
+        if key not in _PREFERENCE_BUCKETS:
+            continue
+        if isinstance(value, dict):
+            sanitized[key] = value
+    return sanitized or None
 
 
 def _default_banner() -> str:
@@ -455,63 +503,6 @@ def _cmd_init_loops(force: bool = False) -> None:
     print(f"  skipped: {skipped}")
     print(f"  disabled: {disabled}")
 
-def _call_claude(prompt: str, max_tokens: int = 512) -> str:
-    msg = get_client().messages.create(
-        model=get_model(),
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return msg.content[0].text.strip()
-
-
-def _parse_goal(user_input: str) -> dict | None:
-    """让 Claude 把自然语言解析成结构化 goal，失败返回 None。"""
-    loops = discover()
-    loop_lines = "\n".join(f"- {n}：{l.description}" for n, l in loops.items())
-    prompt = f"""用户说："{user_input}"
-
-请判断这是否是一个需要执行的任务目标，并解析成结构化数据。
-
-支持的 loop 类型（从下列中选最匹配的一个，或判断为非任务目标）：
-{loop_lines}
-
-触发模式说明：
-- cron  : 固定时间触发，需要 schedule（如"每天早上8点"）
-- goal  : 目标驱动，持续运行直到目标达成（如"保持收件箱零未读"），可搭配初始 schedule
-- event : 事件驱动，实时响应（如"有新邮件时立刻处理"），不需要 schedule
-
-如果是任务目标，输出 JSON：
-{{
-  "is_goal": true,
-  "trigger_mode": "cron 或 goal 或 event",
-  "schedule": "5字段cron（仅 cron/goal 模式需要，event 填 null）。例：每天10点='0 10 * * *'",
-  "goal_condition": "goal 模式时填达成条件描述，其他填 null",
-  "loop": "loop类型",
-  "summary": "一句话描述这个目标",
-  "dry_run": "true 或 false，只有用户明确要求演练/试运行时才为 true",
-  "retry_after_minutes": "整数，可选；仅当用户明确要求时返回，否则返回 null",
-  "max_retries": "整数，可选；仅当用户明确要求时返回，否则返回 null",
-  "retry_backoff_factor": "整数，可选；仅当用户明确要求时返回，否则返回 null",
-  "retry_max_minutes": "整数，可选；仅当用户明确要求时返回，否则返回 null"
-}}
-
-如果不是任务目标（比如闲聊、问问题），输出：
-{{"is_goal": false, "reply": "你的回复"}}
-
-只输出 JSON，不要其他内容。"""
-
-    msg = get_client().messages.create(
-        model=get_model(),
-        max_tokens=512,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = msg.content[0].text.strip()
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
-    return json.loads(raw)
-
-
 def _cmd_list() -> None:
     goals = goals_mod.list_all()
     if not goals:
@@ -544,6 +535,38 @@ def _cmd_list_active_goals() -> None:
     print()
 
 
+def _cmd_list_paused_goals() -> None:
+    goals = [goal for goal in goals_mod.list_all() if goal.get("status") == "paused"]
+    if not goals:
+        print("当前没有暂停的 goal。")
+        return
+
+    print("当前暂停的 goal：")
+    for idx, goal in enumerate(goals, start=1):
+        schedule_label = goal.get("schedule") or "-"
+        print(
+            f"{idx}. {goal['id']} | loop={goal['loop']} | "
+            f"schedule={schedule_label} | {goal['raw']}"
+        )
+    print()
+
+
+def _cmd_list_all_goals() -> None:
+    goals = goals_mod.list_all()
+    if not goals:
+        print("当前没有 goal。")
+        return
+
+    print("当前所有 goal：")
+    for idx, goal in enumerate(goals, start=1):
+        schedule_label = goal.get("schedule") or "-"
+        print(
+            f"{idx}. {goal['id']} | status={goal['status']} | loop={goal['loop']} | "
+            f"schedule={schedule_label} | {goal['raw']}"
+        )
+    print()
+
+
 def _cmd_runs(limit: int = 10) -> None:
     records = _recorder.list_recent(limit=limit)
     if not records:
@@ -569,7 +592,27 @@ def _cmd_goal(goal_id: str) -> None:
     if not goal:
         print(f"未找到目标 {goal_id}")
         return
-    print(json.dumps(goal, ensure_ascii=False, indent=2))
+    lines = [
+        f"Goal ID:   {goal.get('id', '')}",
+        f"状态:      {goal.get('status', '')}",
+        f"Loop:      {goal.get('loop', '')}",
+        f"触发模式:  {goal.get('trigger_mode', 'cron')}",
+        f"Schedule:  {goal.get('schedule', '')}",
+        f"描述:      {goal.get('raw', '')}",
+        f"创建时间:  {goal.get('created_at', '')}",
+        f"最近运行:  {goal.get('last_run', '(未运行)')}",
+        f"最近结果:  {goal.get('last_result', '')}",
+        f"Dry Run:   {goal.get('dry_run', False)}",
+    ]
+    if goal.get("goal_condition"):
+        lines.append(f"Goal条件:  {goal['goal_condition']}")
+    retry_after = goal.get("retry_after_minutes")
+    if retry_after is not None:
+        lines.append(
+            f"重试:      间隔 {retry_after}min, 最多 {goal.get('max_retries')} 次, "
+            f"退避 {goal.get('retry_backoff_factor')}x, 上限 {goal.get('retry_max_minutes')}min"
+        )
+    print("\n".join(lines))
 
 
 def _cmd_run(run_id: str) -> None:
@@ -829,54 +872,161 @@ def _cmd_delete_all_goals() -> None:
         print("删除失败，请检查 goals.json 是否可写。")
 
 
-def _handle_local_nl_intent(user_input: str) -> bool:
-    normalized = _normalize_text(user_input)
+def _cmd_pause_all_goals() -> None:
+    goals = goals_mod.list_all()
+    if not goals:
+        print("当前没有 goal。")
+        return
+    changed = goals_mod.pause_all()
+    for goal in goals:
+        scheduler.pause_goal(goal["id"])
+    print(f"已暂停 {changed} 个 goal。")
 
-    delete_all_patterns = (
-        "删除我所有的goal",
-        "删除所有goal",
-        "删掉所有goal",
-        "清空goal",
-        "清空goals",
-        "删除全部goal",
-        "删除所有目标",
-        "删掉所有目标",
-        "清空目标",
-        "删除全部目标",
-        "deleteallgoals",
-        "deleteallgoal",
-        "removeallgoals",
-        "clearallgoals",
+
+def _cmd_resume_all_goals() -> None:
+    goals = goals_mod.list_all()
+    if not goals:
+        print("当前没有 goal。")
+        return
+    changed = goals_mod.resume_all()
+    for goal in goals_mod.list_all():
+        scheduler.resume_goal(goal["id"])
+    print(f"已恢复 {changed} 个 goal。")
+
+
+def _goal_aliases(goal: dict) -> list[str]:
+    loop_name = goal.get("loop", "")
+    aliases = [goal.get("id", ""), goal.get("raw", ""), loop_name]
+    if loop_name == "daily_briefing_loop":
+        aliases.extend(["简报", "每日简报", "早报", "briefing"])
+    if loop_name == "email_loop":
+        aliases.extend(["邮件", "邮箱", "未读邮件", "邮件处理", "email", "mail"])
+    return [alias for alias in aliases if alias]
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _goal_matches_today(goal: dict) -> bool:
+    today = datetime.now().date().isoformat()
+    last_run = goal.get("last_run") or ""
+    created_at = goal.get("created_at") or ""
+    return last_run.startswith(today) or created_at.startswith(today)
+
+
+def _goal_sort_timestamp(goal: dict) -> float:
+    dt = _parse_iso_datetime(goal.get("last_run")) or _parse_iso_datetime(goal.get("created_at"))
+    return dt.timestamp() if dt else 0.0
+
+
+def _resolve_goal_reference(goal_ref: str) -> list[dict]:
+    normalized_ref = _normalize_lookup_text(goal_ref)
+    if not normalized_ref:
+        return []
+
+    candidates: list[dict] = []
+    for goal in goals_mod.list_all():
+        aliases = [_normalize_lookup_text(alias) for alias in _goal_aliases(goal)]
+        if any(normalized_ref in alias or alias in normalized_ref for alias in aliases if alias):
+            candidates.append(goal)
+    return candidates
+
+
+def _rank_goal_candidates(candidates: list[dict], *, prefer_recent: bool = False, prefer_today: bool = False) -> list[dict]:
+    def score(goal: dict) -> tuple[int, int, int, float]:
+        recent_score = 1 if prefer_recent and (goal.get("last_run") or goal.get("created_at")) else 0
+        today_score = 1 if prefer_today and _goal_matches_today(goal) else 0
+        active_score = 1 if goal.get("status") == "active" else 0
+        return (today_score, recent_score, active_score, _goal_sort_timestamp(goal))
+
+    return sorted(candidates, key=score, reverse=True)
+
+
+def _select_goal_from_ref(goal_ref: str, *, prefer_recent: bool = False, prefer_today: bool = False, deictic: bool = False) -> str | None:
+    candidates = _resolve_goal_reference(goal_ref)
+    if not candidates:
+        return None
+
+    ranked = _rank_goal_candidates(
+        candidates,
+        prefer_recent=prefer_recent or deictic,
+        prefer_today=prefer_today,
     )
-    if any(pattern in normalized for pattern in delete_all_patterns):
+    if len(ranked) > 1:
+        top = ranked[0]
+        second = ranked[1]
+        if _goal_sort_timestamp(top) != _goal_sort_timestamp(second) or top.get("status") != second.get("status"):
+            return top["id"]
+        return None
+    return ranked[0]["id"]
+
+
+
+
+def _execute_local_intent(name: str, slots: dict | None = None) -> bool:
+    slots = slots or {}
+    if name == "delete_all_goals":
         _cmd_delete_all_goals()
         return True
-
-    list_active_goal_patterns = (
-        "当前正在运行的goal有哪些",
-        "当前运行中的goal有哪些",
-        "当前有哪些goal",
-        "现在有哪些goal",
-        "有哪些goal",
-        "有哪些goals",
-        "当前goal有哪些",
-        "当前目标有哪些",
-        "当前有哪些目标",
-        "现在有哪些目标",
-        "正在运行的goal有哪些",
-        "正在运行的目标有哪些",
-        "运行中的goal有哪些",
-        "运行中的目标有哪些",
-        "列出所有goal",
-        "列出所有目标",
-        "查看所有goal",
-        "查看所有目标",
-    )
-    if any(pattern in normalized for pattern in list_active_goal_patterns):
+    if name == "pause_all_goals":
+        _cmd_pause_all_goals()
+        return True
+    if name == "resume_all_goals":
+        _cmd_resume_all_goals()
+        return True
+    if name == "list_all_goals":
+        _cmd_list_all_goals()
+        return True
+    if name == "list_active_goals":
         _cmd_list_active_goals()
+        return True
+    if name == "list_paused_goals":
+        _cmd_list_paused_goals()
+        return True
+
+    goal_id = slots.get("goal_id")
+    goal_ref = slots.get("goal_ref")
+    if not goal_id and goal_ref:
+        goal_id = _select_goal_from_ref(
+            goal_ref,
+            prefer_recent=slots.get("prefer_recent") == "true",
+            prefer_today=slots.get("prefer_today") == "true",
+            deictic=slots.get("deictic") == "true",
+        )
+        if not goal_id:
+            return False
+    if name == "delete_goal" and goal_id:
+        _cmd_delete(goal_id)
+        return True
+    if name == "pause_goal" and goal_id:
+        _cmd_pause(goal_id)
+        return True
+    if name == "resume_goal" and goal_id:
+        _cmd_resume(goal_id)
+        return True
+    if name == "rerun_goal" and goal_id:
+        _cmd_rerun(goal_id)
+        return True
+    if name == "show_goal" and goal_id:
+        _cmd_goal(goal_id)
         return True
 
     return False
+
+
+_CLARIFY_MESSAGES = {
+    "missing_goal_target": "我还不能确定你要操作哪个 goal。请直接给我 goal_id，或者补充更具体的描述。",
+    "ambiguous_goal_target": "我还不能唯一定位目标。请直接给我 goal_id，或者补充更具体的描述。",
+    "missing_schedule": "我理解你是在创建目标，但还缺少明确时间。请补充具体时间。",
+    "unsupported_request": "这条输入我还不能稳定执行。请换一种更具体的说法。",
+    "unclear_request": "我还不能稳定理解这条输入。请换一种更明确的说法。",
+}
 
 
 def _cmd_help() -> None:
@@ -916,19 +1066,21 @@ init 示例：
 """)
 
 
-def _handle_input(user_input: str) -> None:
+def _process_input(user_input: str) -> dict:
     parts = user_input.strip().split()
     if not parts:
-        return
+        return {"route": "empty", "command": None, "ai_result": None, "execution": {"executed": False}}
 
     cmd = parts[0].lower()
+    execution = {"executed": True, "kind": "command"}
 
     if cmd == "list":
         _cmd_list()
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "init":
         parsed = _parse_init_command(user_input)
         if not parsed:
-            return
+            return {"route": "command", "command": cmd, "ai_result": None, "execution": {"executed": False, "kind": "command"}}
         mode, options = parsed
         if mode == "root":
             _cmd_init(force=options["force"])
@@ -940,64 +1092,127 @@ def _handle_input(user_input: str) -> None:
             )
         elif mode == "loops":
             _cmd_init_loops(force=options["force"])
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "goal" and len(parts) >= 2:
         _cmd_goal(parts[1])
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "runs":
         limit = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 10
         _cmd_runs(limit)
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "run" and len(parts) >= 2:
         _cmd_run(parts[1])
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "goalmem" and len(parts) >= 2:
         _cmd_goalmem(parts[1])
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "loopmem" and len(parts) >= 2:
         _cmd_loopmem(parts[1])
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "add":
         parsed = _parse_add_command(user_input)
         if not parsed:
-            return
+            return {"route": "command", "command": cmd, "ai_result": None, "execution": {"executed": False, "kind": "command"}}
         overrides, description = parsed
         try:
-            result = _parse_goal(description)
+            from ai_input_resolver import ai_resolve_input
+            result = ai_resolve_input(
+                description,
+                goals=goals_mod.list_all(),
+                loops=discover(),
+            )
         except Exception as e:
             print(f"解析失败: {e}")
-            return
-        if not result.get("is_goal"):
-            print(result.get("reply", "我不太理解，请重新描述。"))
-            return
-        _create_goal_from_result(description, result, overrides=overrides)
+            return {
+                "route": "command",
+                "command": cmd,
+                "ai_result": None,
+                "execution": {"executed": False, "kind": "command", "reason": "resolve_failed"},
+            }
+        if result.get("kind") != "create_goal":
+            if result.get("kind") == "clarify":
+                print(result.get("message") or _CLARIFY_MESSAGES["missing_schedule"])
+            elif result.get("kind") == "chat":
+                print(result.get("message", "我不太理解，请重新描述。"))
+            else:
+                print(_CLARIFY_MESSAGES["unsupported_request"])
+            return {
+                "route": "command_ai",
+                "command": cmd,
+                "ai_result": result,
+                "execution": {"executed": False, "kind": result.get("kind", "unknown")},
+            }
+        _create_goal_from_result(description, result.get("goal") or {}, overrides=overrides)
+        return {
+            "route": "command_ai",
+            "command": cmd,
+            "ai_result": result,
+            "execution": {"executed": True, "kind": "create_goal", "loop": (result.get("goal") or {}).get("loop")},
+        }
     elif cmd == "pause" and len(parts) >= 2:
         _cmd_pause(parts[1])
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "resume" and len(parts) >= 2:
         _cmd_resume(parts[1])
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "delete" and len(parts) >= 2:
         _cmd_delete(parts[1])
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd == "rerun":
         parsed = _parse_rerun_command(user_input)
         if not parsed:
-            return
+            return {"route": "command", "command": cmd, "ai_result": None, "execution": {"executed": False, "kind": "command"}}
         options, goal_id = parsed
         _cmd_rerun(goal_id, dry_run_override=options.get("dry_run"))
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd in ("help", "?"):
         _cmd_help()
+        return {"route": "command", "command": cmd, "ai_result": None, "execution": execution}
     elif cmd in ("exit", "quit"):
         print("再见！")
         scheduler.stop()
         sys.exit(0)
     else:
-        if _handle_local_nl_intent(user_input):
-            return
-        # 自然语言，交给 Claude 解析
-        try:
-            result = _parse_goal(user_input)
-        except Exception as e:
-            print(f"解析失败: {e}")
-            return
+        return _chat_harness.run(
+            user_input,
+            goals=goals_mod.list_all(),
+            loops=discover(),
+        )
 
-        if not result.get("is_goal"):
-            print(result.get("reply", "我不太理解，请重新描述。"))
-            return
+    print(_CLARIFY_MESSAGES["unsupported_request"])
+    return {"route": "command", "command": cmd, "ai_result": None, "execution": {"executed": False, "kind": "command"}}
 
-        _create_goal_from_result(user_input, result)
+
+_MAX_ASSISTANT_RESPONSE = 400
+
+
+def _record_conversation(user_input: str, assistant_response: str, interaction: dict) -> None:
+    response_text = " ".join(assistant_response.strip().split())
+    if len(response_text) > _MAX_ASSISTANT_RESPONSE:
+        response_text = response_text[:_MAX_ASSISTANT_RESPONSE - 3] + "..."
+    if not user_input.strip():
+        return
+    try:
+        record = _conversation_recorder.build_record(
+            user_input=user_input,
+            assistant_response=response_text,
+            route=interaction.get("route", "unknown"),
+            command=interaction.get("command"),
+            ai_result=interaction.get("ai_result"),
+            execution=interaction.get("execution") or {},
+        )
+        _conversation_recorder.save(record)
+    except Exception as e:
+        log.error(f"conversation_records 保存失败: {e}")
+
+
+def _handle_input(user_input: str) -> None:
+    buffer = io.StringIO()
+    interaction: dict = {}
+    tee = _TeeStdout(sys.stdout, buffer)
+    with redirect_stdout(tee):
+        interaction = _process_input(user_input)
+    _record_conversation(user_input, buffer.getvalue(), interaction)
 
 
 def _read_user_input() -> str:
@@ -1016,6 +1231,8 @@ def _read_user_input() -> str:
 def main() -> None:
     _print_startup_banner()
     scheduler.start()
+    _conversation_recorder.cleanup_old_files()
+    _recorder.cleanup_old_files()
 
     try:
         while True:

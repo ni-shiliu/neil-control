@@ -164,6 +164,27 @@ class EmailLoop(BaseLoop):
         return None
 
     @staticmethod
+    def _merge_preferences(base: dict, overrides: dict) -> dict:
+        merged = dict(base)
+        for key, value in overrides.items():
+            if isinstance(merged.get(key), dict) and isinstance(value, dict):
+                merged[key] = EmailLoop._merge_preferences(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _resolved_preferences(self, ctx: "RunContext | None" = None) -> dict:
+        if not ctx:
+            return {}
+        loop_preferences = ctx.memory.get("preferences", {})
+        goal_preferences = ctx.goal_memory.get("preferences", {})
+        if not isinstance(loop_preferences, dict):
+            loop_preferences = {}
+        if not isinstance(goal_preferences, dict):
+            goal_preferences = {}
+        return self._merge_preferences(loop_preferences, goal_preferences)
+
+    @staticmethod
     def _effect_key(uid: str, action: str) -> str:
         return f"email:{uid}:{action}"
 
@@ -296,6 +317,9 @@ action 选项：
     def execute(self, context: dict, ctx: "RunContext | None" = None) -> dict:
         sent, drafted, skipped, failed = [], [], [], []
         memory = context.get("memory", {})
+        preferences = self._resolved_preferences(ctx)
+        behavior_preferences = preferences.get("behavior", {})
+        draft_first = behavior_preferences.get("draft_first", False)
 
         effects = ctx.effects if ctx else None
 
@@ -374,6 +398,8 @@ action 选项：
                     reply_text = gen2.get("reply", reply_text)
 
                 auto_send = os.environ.get("EMAIL_AUTO_SEND", "false").lower() == "true"
+                if draft_first:
+                    auto_send = False
                 if auto_send and risk == "low" and confidence >= AUTO_SEND_CONFIDENCE:
                     success_item = {
                         "uid": uid,
@@ -403,6 +429,8 @@ action 选项：
                     reason = gen.get("risk_reason", "") or f"risk={risk} conf={confidence}"
                     if not auto_send:
                         reason = f"[自动发送已关闭] {reason}".strip()
+                    if draft_first:
+                        reason = f"[已按偏好优先存草稿] {reason}".strip()
                     success_item = {
                         "uid": uid,
                         "subject": subject,

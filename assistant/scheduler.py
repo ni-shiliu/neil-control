@@ -16,6 +16,7 @@ from apscheduler.triggers.date import DateTrigger
 
 import goals as goals_mod
 import notifier
+from conversation_records import ConversationRecorder
 from engine.records import RunRecorder
 from loops import discover
 
@@ -23,7 +24,9 @@ log = logging.getLogger(__name__)
 
 _scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 _run_recorder = RunRecorder()
+_conversation_recorder = ConversationRecorder()
 _RUN_RECORDS_CLEANUP_JOB_ID = "__cleanup_run_records__"
+_CONVERSATION_RECORDS_CLEANUP_JOB_ID = "__cleanup_conversation_records__"
 
 
 def _safe_increment_failure(goal_id: str) -> int:
@@ -55,6 +58,15 @@ def _cleanup_run_records() -> None:
             log.info(f"run_records 定时清理完成，删除 {deleted} 个历史文件")
     except Exception as e:
         log.error(f"run_records 定时清理失败: {e}")
+
+
+def _cleanup_conversation_records() -> None:
+    try:
+        deleted = _conversation_recorder.cleanup_old_files()
+        if deleted:
+            log.info(f"conversation_records 定时清理完成，删除 {deleted} 个历史文件")
+    except Exception as e:
+        log.error(f"conversation_records 定时清理失败: {e}")
 
 
 def _compute_failure_delay(goal: dict, failure_count: int) -> timedelta:
@@ -163,7 +175,14 @@ def start() -> None:
         id=_RUN_RECORDS_CLEANUP_JOB_ID,
         replace_existing=True,
     )
+    _scheduler.add_job(
+        _cleanup_conversation_records,
+        trigger=CronTrigger(hour=3, minute=5, timezone="Asia/Shanghai"),
+        id=_CONVERSATION_RECORDS_CLEANUP_JOB_ID,
+        replace_existing=True,
+    )
     _cleanup_run_records()
+    _cleanup_conversation_records()
     for goal in goals_mod.list_all():
         if goal["status"] == "active":
             _register(goal)
