@@ -34,6 +34,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from engine.agentic_step import run_agentic_step
+from engine.capability_catalog import render_loop_catalog, render_tool_catalog
 from engine.harness import HarnessHooks, HarnessRunContext, HarnessState
 from engine.memory import MemoryStore
 from engine.runtime_context import ChatRuntimeContext, build_chat_runtime_context
@@ -157,7 +158,8 @@ class ChatHarness:
 
     def _build_system_prompt(self, ctx: ChatRuntimeContext) -> str:
         goals_summary = self._summarize_goals(ctx.goals)
-        loops_summary = self._summarize_loops(ctx.loops)
+        loops_summary = render_loop_catalog(ctx.capability_catalog.loops)
+        tools_summary = render_tool_catalog(ctx.capability_catalog.tools)
         user_memory_summary = self._summarize_user_memory(ctx.user_memory)
         conversations_summary = self._summarize_conversations(ctx.recent_conversations)
         runtime_section = f"\n用户全局运行偏好（RUNTIME.md）：\n{ctx.runtime_doc}" if ctx.runtime_doc else ""
@@ -168,8 +170,11 @@ class ChatHarness:
 当前 goals：
 {goals_summary}
 
-当前支持的 loops：
+当前支持的 Loops（业务闭环，可创建 goal / 可调度）：
 {loops_summary}
+
+当前支持的 Tools（原子能力，loop 可依赖；部分 tool 可被聊天按需调用）：
+{tools_summary}
 
 用户长期偏好（持久记忆）：
 {user_memory_summary}
@@ -180,6 +185,10 @@ class ChatHarness:
 
 工作原则：
 - 能确定用户意图时，直接调用 tool，不要反复询问确认
+- 用户要求打开网页、用 Chrome 打开 URL、浏览器访问某个地址时，调用 browser_open_url
+- 用户要求在当前网页继续操作时，先用 browser_observe 看当前页面，再用 browser_click_text / browser_type / browser_wait
+- 如果 browser_click_text 找不到目标，不要编造；根据工具返回的可见候选告诉用户当前页面没有该入口
+- 不要混淆 loop 和 tool：loop 用于创建/调度自动化目标，tool 用于一次性动作或被 loop 依赖
 - 如果 goal 不明确，可以先调 list_goals 再决策
 - goal_nicknames 中有别名时，优先用别名解析用户引用的目标
 - 偏好类请求（"以后简报多一点 AI 新闻"）调 update_goal_preferences 或 update_loop_preferences
