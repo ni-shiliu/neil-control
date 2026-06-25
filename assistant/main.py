@@ -10,6 +10,7 @@ import logging
 import shlex
 import io
 import sys
+import re
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1145,6 +1146,31 @@ def _handle_browser(user_input: str, cmd: str) -> dict:
     return _cmd_result(cmd)
 
 
+def _extract_url(text: str) -> str | None:
+    match = re.search(r"https?://[^\s，。；,;]+", text)
+    return match.group(0) if match else None
+
+
+def _cmd_open_browser_url(url: str) -> None:
+    from engine.tools.browser.actions import open_url
+
+    result = open_url(url)
+    if not result.ok:
+        print(f"打开失败：{result.message}")
+        return
+    state = result.state
+    print(f"已在 Chrome 打开：{state.title if state else '(无标题)'} | {state.url if state else url}")
+
+
+def _handle_chrome(user_input: str, cmd: str) -> dict:
+    url = _extract_url(user_input)
+    if not url:
+        print("用法：chrome 打开 https://example.com")
+        return _cmd_result(cmd, executed=False)
+    _cmd_open_browser_url(url)
+    return _cmd_result(cmd)
+
+
 def _process_input(user_input: str) -> dict:
     parts = user_input.strip().split()
     if not parts:
@@ -1195,6 +1221,8 @@ def _process_input(user_input: str) -> dict:
         return _handle_rerun(user_input, cmd)
     if cmd == "browser":
         return _handle_browser(user_input, cmd)
+    if cmd == "chrome":
+        return _handle_chrome(user_input, cmd)
 
     # 退出
     if cmd in ("exit", "quit"):
@@ -1233,8 +1261,12 @@ def _handle_input(user_input: str) -> None:
     buffer = io.StringIO()
     interaction: dict = {}
     tee = _TeeStdout(sys.stdout, buffer)
-    with redirect_stdout(tee):
-        interaction = _process_input(user_input)
+    try:
+        with redirect_stdout(tee):
+            interaction = _process_input(user_input)
+    except KeyboardInterrupt:
+        print("\n已取消当前操作。")
+        return
     _record_conversation(user_input, buffer.getvalue(), interaction)
 
 
