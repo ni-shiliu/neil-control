@@ -27,17 +27,33 @@
 
 ## 内置工具 / 能力
 
+Neil Assistant 将能力分成两类：
+
+- **Loop Catalog**：业务闭环，可创建 goal、可调度、有 run record / memory / verify / report。
+- **Tool Catalog**：原子能力，不负责业务闭环，可被 loop 通过 `required_tools` 依赖；部分低风险 tool 也可以被聊天按需调用。
+
+启动和每轮聊天只注入轻量能力目录，不注入完整实现细节；当用户输入命中某个 tool 时，才按需加载该 tool 的详细 schema / executor。
+
 Loop 可以通过 `required_tools` 声明运行时依赖，Engine 会在 `ctx.tools` 中按需注入。
 
 | 工具 | 用途 | Loop 中的声明 | 运行时入口 |
 |---|---|---|---|
-| `browser` | 控制本机 Chrome：打开页面、读取页面状态、点击元素、输入文本、等待页面变化 | `required_tools = ["browser"]` | `ctx.tools.browser` |
+| `browser` | 控制本机 Chrome：打开页面、读取页面状态、按文本点击元素、输入文本、等待页面变化 | `required_tools = ["browser"]` | `ctx.tools.browser` |
 | `claude` | 调用 Claude 完成生成、分析、结构化判断 | `required_tools = ["claude"]` | `ctx.tools.claude` |
 | `imap` | 读取邮箱未读邮件 | `required_tools = ["imap"]` | `ctx.tools.imap` |
 | `smtp` | 发送邮件或保存草稿 | `required_tools = ["smtp"]` | `ctx.tools.smtp` |
 | `telegram` | 发送 Telegram 消息或文档 | `required_tools = ["telegram"]` | `ctx.tools.telegram` |
 
 浏览器能力当前基于 macOS Chrome + Apple Events，适合作为后续网页自动化 loop 的底层能力；业务 loop 只应依赖 `ctx.tools.browser`，不要直接依赖具体 Chrome 实现。
+
+聊天侧按需暴露的浏览器 action tools：
+
+- `browser_open_url`
+- `browser_observe`
+- `browser_click_text`
+- `browser_type`
+- `browser_wait`
+- `browser_diagnostic`
 
 ## 快速开始
 
