@@ -15,6 +15,7 @@ import os
 import re
 from html import unescape
 from datetime import datetime
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import requests
@@ -26,6 +27,11 @@ if TYPE_CHECKING:
     from engine.context import RunContext
 
 log = logging.getLogger(__name__)
+
+
+def _progress(message: str) -> None:
+    if os.environ.get("ASSISTANT_PROGRESS", "1").lower() not in {"0", "false", "no"}:
+        print(message, flush=True)
 
 DEFAULT_BANNED_ENGLISH_PHRASES = [
     "Let's circle back on this later.",
@@ -161,17 +167,26 @@ class DailyBriefingLoop(BaseLoop):
         max_tokens: int = 4096,
         ctx: "RunContext | None" = None,
     ) -> str:
-        if ctx and ctx.tools.claude:
-            return ctx.tools.claude.complete(prompt, max_tokens=max_tokens)
+        started = perf_counter()
+        log.info("调用 Claude 生成内容 max_tokens=%s...", max_tokens)
+        try:
+            if ctx and ctx.tools.claude:
+                result = ctx.tools.claude.complete(prompt, max_tokens=max_tokens)
+            else:
+                from claude_client import get_client, get_model
 
-        from claude_client import get_client, get_model
+                msg = get_client().messages.create(
+                    model=get_model(),
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                result = msg.content[0].text.strip()
+        except Exception:
+            log.exception("Claude 调用失败 max_tokens=%s", max_tokens)
+            raise
 
-        msg = get_client().messages.create(
-            model=get_model(),
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return msg.content[0].text.strip()
+        log.info("Claude 调用完成 max_tokens=%s duration=%.1fs", max_tokens, perf_counter() - started)
+        return result
 
     # ── 数据抓取 ─────────────────────────────────────────
 
@@ -306,6 +321,7 @@ class DailyBriefingLoop(BaseLoop):
 
     def plan(self, goal: dict, ctx=None) -> dict:
         log.info("并发抓取数据源...")
+        _progress("执行中: 正在抓取天气、头条、GitHub、HN、36kr...")
         today = datetime.now().strftime("%Y年%m月%d日 %A")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -322,6 +338,11 @@ class DailyBriefingLoop(BaseLoop):
             f"数据抓取完成 | 头条:{len(results['toutiao'])} "
             f"GitHub:{len(results['github'])} HN:{len(results['hackernews'])} "
             f"36kr:{len(results['36kr'])}"
+        )
+        _progress(
+            f"执行中: 数据抓取完成，头条 {len(results['toutiao'])} 条，"
+            f"GitHub {len(results['github'])} 条，HN {len(results['hackernews'])} 条，"
+            f"36kr {len(results['36kr'])} 条。"
         )
         return {"today": today, **results}
 
@@ -460,6 +481,7 @@ class DailyBriefingLoop(BaseLoop):
         top_url = self._find_top_story_url(toutiao, hn, github)
 
         # ── 第一步：生成主体 HTML ───────────────────────────
+        _progress("执行中: 正在调用 Claude 生成简报 HTML...")
         prompt = f"""今天是 {today}。
 
 你是一位有品味的内容编辑，请基于以下数据生成一份今日个人简报 HTML。
@@ -532,6 +554,7 @@ HTML 末尾留一个注释占位：<!-- ENGLISH_BLOCK -->
 
         # ── 第二步：单独生成每日英文，强制插入 ───────────────
         log.info("生成每日英文模块...")
+        _progress("执行中: 正在生成每日英文模块...")
         english_block = ""
         english_phrase = ""
         if include_english_phrase is not False:
@@ -552,6 +575,7 @@ HTML 末尾留一个注释占位：<!-- ENGLISH_BLOCK -->
         }
         self._set_output(result, html, today, ctx=ctx)
         self._queue_delivery_effect(result, today, ctx=ctx)
+        _progress("执行中: 简报内容已生成，正在发送 Telegram 文件...")
         return result
 
     def verify(self, result: dict) -> tuple[bool, str]:
