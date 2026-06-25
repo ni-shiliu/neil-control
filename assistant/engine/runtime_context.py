@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from engine.capability_catalog import CapabilityCatalog, build_capability_catalog
 from engine.context import RunContext, ToolRegistry
 from engine.memory import MemoryStore
 from engine.records import RunRecorder
@@ -37,6 +38,7 @@ class ChatRuntimeContext:
     recent_conversations: list[dict[str, Any]] = field(default_factory=list)
     user_memory: dict[str, Any] = field(default_factory=dict)
     runtime_doc: str = ""
+    capability_catalog: CapabilityCatalog = field(default_factory=CapabilityCatalog)
 
 
 def assistant_dir() -> Path:
@@ -128,4 +130,5 @@ def build_chat_runtime_context(
         recent_conversations=recent_conversations,
         user_memory=memory_store.load_user_memory(),
         runtime_doc=load_runtime_doc(),
+        capability_catalog=build_capability_catalog(loops),
     )
