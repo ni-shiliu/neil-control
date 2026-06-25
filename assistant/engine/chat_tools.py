@@ -206,6 +206,74 @@ TOOL_SCHEMAS: list[dict] = [
             "required": [],
         },
     },
+    {
+        "name": "browser_open_url",
+        "description": "用本机 Chrome 打开一个明确 URL。用于用户说「chrome 打开」「浏览器打开」「访问这个网址」等一次性浏览器操作。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "要打开的网址，必须是 http 或 https URL"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "browser_observe",
+        "description": "读取当前 Chrome 活动标签页的 URL、标题、正文摘要和可操作元素摘要。",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "browser_click_text",
+        "description": "在当前 Chrome 活动标签页中点击包含指定文本的可见元素。用于「点击我的」「进入购物车」等。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "要点击的页面文本"},
+                "exact": {"type": "boolean", "description": "是否要求文本完全匹配，默认 false"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "browser_type",
+        "description": "向当前 Chrome 活动标签页中指定 selector 的输入框输入文本。优先先用 browser_observe 找 selector。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector，例如 input[placeholder=\"请输入手机号\"]"},
+                "text": {"type": "string", "description": "要输入的文本"},
+            },
+            "required": ["selector", "text"],
+        },
+    },
+    {
+        "name": "browser_wait",
+        "description": "等待当前 Chrome 活动标签页一段时间，或等待 URL/正文包含指定文本。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "timeout_ms": {"type": "integer", "description": "等待毫秒数，默认 2000"},
+                "text_contains": {"type": "string", "description": "等待页面正文包含该文本"},
+                "url_contains": {"type": "string", "description": "等待 URL 包含该文本"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "browser_diagnostic",
+        "description": "检查本机 Chrome 浏览器能力是否可用，包括 Apple Events、DOM 读取、点击和输入。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keep": {"type": "boolean", "description": "是否保留诊断标签页，默认 false"},
+            },
+            "required": [],
+        },
+    },
 ]
 
 # ── Tool Executor ─────────────────────────────────────────────────────────────
@@ -227,6 +295,12 @@ def execute_tool(name: str, tool_input: dict, harness: "ChatHarness") -> str:
             "update_goal_preferences":  lambda: _tool_update_goal_preferences(tool_input, harness),
             "update_loop_preferences":  lambda: _tool_update_loop_preferences(tool_input, harness),
             "update_user_preferences":  lambda: _tool_update_user_preferences(tool_input, harness),
+            "browser_open_url":          lambda: _tool_browser_open_url(tool_input),
+            "browser_observe":           lambda: _tool_browser_observe(tool_input),
+            "browser_click_text":        lambda: _tool_browser_click_text(tool_input),
+            "browser_type":              lambda: _tool_browser_type(tool_input),
+            "browser_wait":              lambda: _tool_browser_wait(tool_input),
+            "browser_diagnostic":        lambda: _tool_browser_diagnostic(tool_input),
         }
         if name not in _dispatch:
             return f"未知 tool: {name}"
@@ -469,3 +543,88 @@ def _tool_update_user_preferences(inp: dict, harness: "ChatHarness") -> str:
     if goal_nicknames:
         parts.append(f"别名: {', '.join(f'{k}→{v}' for k, v in goal_nicknames.items())}")
     return f"已记住 {' | '.join(parts)}"
+
+
+def _tool_browser_open_url(inp: dict) -> str:
+    from engine.tools.browser.actions import open_url
+    url = (inp.get("url") or "").strip()
+
+    result = open_url(url)
+    if not result.ok:
+        return f"打开失败：{result.message}"
+    state = result.state
+    return f"已在 Chrome 打开：{state.title if state else '(无标题)'} | {state.url if state else url}"
+
+
+def _tool_browser_observe(inp: dict) -> str:
+    from engine.tools.browser.actions import observe_active
+
+    result = observe_active()
+    state = result.state
+    if state is None:
+        return "读取失败：未返回页面状态。"
+    elements = [
+        {
+            "selector": item.get("selector"),
+            "text": item.get("text"),
+            "placeholder": item.get("placeholder"),
+            "type": item.get("type"),
+        }
+        for item in state.elements[:30]
+    ]
+    return json.dumps(
+        {
+            "url": state.url,
+            "title": state.title,
+            "text_prefix": state.text[:1000],
+            "elements": elements,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _tool_browser_click_text(inp: dict) -> str:
+    from engine.tools.browser.actions import click_text
+
+    text = (inp.get("text") or "").strip()
+    if not text:
+        return "点击失败：text 不能为空。"
+    result = click_text(text, exact=bool(inp.get("exact", False)))
+    if not result.ok:
+        return f"点击失败：{result.message}"
+    state = result.state
+    return f"已点击：{text} | 当前页面：{state.title if state else ''} {state.url if state else ''}"
+
+
+def _tool_browser_type(inp: dict) -> str:
+    from engine.tools.browser.actions import type_text
+
+    selector = (inp.get("selector") or "").strip()
+    text = inp.get("text")
+    if not selector:
+        return "输入失败：selector 不能为空。"
+    if text is None:
+        return "输入失败：text 不能为空。"
+    result = type_text(selector, str(text))
+    if not result.ok:
+        return f"输入失败：{result.message}"
+    return f"已输入到 {selector}"
+
+
+def _tool_browser_wait(inp: dict) -> str:
+    from engine.tools.browser.actions import wait_for
+
+    result = wait_for(
+        timeout_ms=int(inp.get("timeout_ms") or 2_000),
+        text_contains=inp.get("text_contains"),
+        url_contains=inp.get("url_contains"),
+    )
+    state = result.state
+    return f"{result.message} | 当前页面：{state.title if state else ''} {state.url if state else ''}"
+
+
+def _tool_browser_diagnostic(inp: dict) -> str:
+    from engine.tools.browser.diagnostics import render_browser_diagnostic, run_browser_diagnostic
+
+    return render_browser_diagnostic(run_browser_diagnostic(keep=bool(inp.get("keep", False))))
