@@ -140,9 +140,22 @@ def _page_elements_js() -> str:
     return parts.length ? `body > ${parts.join(' > ')}` : tag;
   }
 
-  const nodes = Array.from(document.querySelectorAll(
-    'a,button,input,textarea,select,[role="button"],[contenteditable="true"]'
-  )).slice(0, 120);
+  const interactive = Array.from(document.querySelectorAll(
+    'a,button,input,textarea,select,[role="button"],[contenteditable="true"],[onclick]'
+  ));
+  const textNodes = Array.from(document.querySelectorAll('body *')).filter((el) => {
+    const text = (el.innerText || el.textContent || '').trim();
+    if (!text || text.length > 80) return false;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return false;
+    return Array.from(el.children || []).every((child) => !(child.innerText || child.textContent || '').trim());
+  });
+  const seen = new Set();
+  const nodes = [...interactive, ...textNodes].filter((el) => {
+    if (seen.has(el)) return false;
+    seen.add(el);
+    return true;
+  }).slice(0, 160);
   return JSON.stringify(nodes.map((el, index) => {
     const tag = el.tagName ? el.tagName.toLowerCase() : '';
     return {
@@ -407,6 +420,15 @@ JSON.stringify({ id: `w1:t${tabIndex}` });
     def claim_tab(self, tab_id: str) -> BrowserSession:
         _split_tab_id(tab_id)
         return ChromeBrowserSession(self._bridge, tab_id)
+
+    def claim_active_tab(self) -> BrowserSession:
+        tabs = self.list_tabs()
+        active_tab = next((tab for tab in tabs if tab.active), None)
+        if active_tab is None:
+            if not tabs:
+                raise ChromeBridgeError("no Chrome tabs are available")
+            active_tab = tabs[0]
+        return self.claim_tab(active_tab.id)
 
 
 def _condition_matches(state: PageState, condition: WaitCondition) -> bool:
