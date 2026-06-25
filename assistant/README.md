@@ -25,6 +25,20 @@
 | `daily_briefing_loop` | 生成并发送每日简报 | `cron` | `claude`, `telegram` | HTML output, `send_telegram_document` |
 | `email_loop` | 处理未读邮件，自动回复或存草稿 | `cron`, `goal`, `event` | `imap`, `smtp`, `claude`, `telegram` | `mark_read`, `send_email_and_mark_read`, `save_draft_and_mark_read` |
 
+## 内置工具 / 能力
+
+Loop 可以通过 `required_tools` 声明运行时依赖，Engine 会在 `ctx.tools` 中按需注入。
+
+| 工具 | 用途 | Loop 中的声明 | 运行时入口 |
+|---|---|---|---|
+| `browser` | 控制本机 Chrome：打开页面、读取页面状态、点击元素、输入文本、等待页面变化 | `required_tools = ["browser"]` | `ctx.tools.browser` |
+| `claude` | 调用 Claude 完成生成、分析、结构化判断 | `required_tools = ["claude"]` | `ctx.tools.claude` |
+| `imap` | 读取邮箱未读邮件 | `required_tools = ["imap"]` | `ctx.tools.imap` |
+| `smtp` | 发送邮件或保存草稿 | `required_tools = ["smtp"]` | `ctx.tools.smtp` |
+| `telegram` | 发送 Telegram 消息或文档 | `required_tools = ["telegram"]` | `ctx.tools.telegram` |
+
+浏览器能力当前基于 macOS Chrome + Apple Events，适合作为后续网页自动化 loop 的底层能力；业务 loop 只应依赖 `ctx.tools.browser`，不要直接依赖具体 Chrome 实现。
+
 ## 快速开始
 
 推荐使用 `python3.12`。
@@ -147,6 +161,30 @@ python3.12 main.py
 > loopmem email_loop
 > goalmem goal_xxxxxx
 ```
+
+### 浏览器能力诊断
+
+Neil Assistant 提供本机 Chrome 浏览器能力，用于后续 loop 打开页面、读取页面状态、点击元素和输入文本。
+
+首次使用前，请在 Chrome 菜单中开启：
+
+```text
+Chrome -> View -> Developer -> Allow JavaScript from Apple Events
+```
+
+然后运行诊断：
+
+```text
+> browser doctor
+```
+
+也可以在命令行直接运行：
+
+```bash
+python3.12 -m engine.tools.browser.diagnostics
+```
+
+如果诊断中 `javascript_from_apple_events` 为 `disabled`，浏览器能力只能读取 URL/title，不能稳定读取 DOM、点击元素或输入文本。
 
 ### 初始化可选文件
 

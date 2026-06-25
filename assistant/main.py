@@ -186,7 +186,7 @@ class AssistantCompleter(Completer):
         commands = [
             "list", "init", "goal", "pause", "resume", "delete",
             "rerun", "runs", "run", "goalmem", "loopmem",
-            "add", "help", "exit", "quit",
+            "browser", "add", "help", "exit", "quit",
         ]
         if not parts:
             for cmd in commands:
@@ -231,6 +231,12 @@ class AssistantCompleter(Completer):
             for option in ("--dry-run", "--retry-after", "--max-retries", "--backoff", "--retry-max"):
                 if option.startswith(word):
                     yield Completion(option, start_position=-len(word))
+            return
+
+        if cmd == "browser":
+            for item in ("doctor", "--keep"):
+                if item.startswith(word):
+                    yield Completion(item, start_position=-len(word))
             return
 
 
@@ -1035,6 +1041,7 @@ def _cmd_help() -> None:
   run <run_id>          查看某条运行记录详情
   goalmem <goal_id>     查看某个 goal 的 memory
   loopmem <loop_name>   查看某个 loop 的长期 memory
+  browser doctor [--keep]  检查本机 Chrome 浏览器能力
   help                  显示帮助
   exit / quit           退出
 
@@ -1052,6 +1059,10 @@ init 示例：
   init loop my_loop
   init loop my_loop --with-doc
   init loops
+
+browser 示例：
+  browser doctor
+  browser doctor --keep
 """)
 
 
@@ -1109,6 +1120,31 @@ def _handle_rerun(user_input: str, cmd: str) -> dict:
     return _cmd_result(cmd)
 
 
+def _handle_browser(user_input: str, cmd: str) -> dict:
+    try:
+        tokens = shlex.split(user_input)
+    except ValueError as e:
+        print(f"命令解析失败: {e}")
+        return _cmd_result(cmd, executed=False)
+
+    if len(tokens) < 2 or tokens[1] != "doctor":
+        print("用法：browser doctor [--keep]")
+        return _cmd_result(cmd, executed=False)
+
+    keep = False
+    for token in tokens[2:]:
+        if token == "--keep":
+            keep = True
+        else:
+            print(f"browser doctor 不支持参数 {token}。")
+            return _cmd_result(cmd, executed=False)
+
+    from engine.tools.browser.diagnostics import render_browser_diagnostic, run_browser_diagnostic
+
+    print(render_browser_diagnostic(run_browser_diagnostic(keep=keep)))
+    return _cmd_result(cmd)
+
+
 def _process_input(user_input: str) -> dict:
     parts = user_input.strip().split()
     if not parts:
@@ -1157,6 +1193,8 @@ def _process_input(user_input: str) -> dict:
         return _handle_add(user_input, cmd)
     if cmd == "rerun":
         return _handle_rerun(user_input, cmd)
+    if cmd == "browser":
+        return _handle_browser(user_input, cmd)
 
     # 退出
     if cmd in ("exit", "quit"):

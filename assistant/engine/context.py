@@ -13,6 +13,7 @@ from engine.effects import EffectCollector
 
 if TYPE_CHECKING:
     from engine.tools.claude_tool import ClaudeTool
+    from engine.tools.browser import BrowserCapability
     from engine.tools.imap_tool import IMAPTool
     from engine.tools.smtp_tool import SMTPTool
     from engine.tools.telegram_tool import TelegramTool
@@ -24,6 +25,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class ToolRegistry:
     claude: "ClaudeTool | None" = None
+    browser: "BrowserCapability | None" = None
     imap: "IMAPTool | None" = None
     smtp: "SMTPTool | None" = None
     telegram: "TelegramTool | None" = None
@@ -31,6 +33,7 @@ class ToolRegistry:
     @classmethod
     def build(cls, required: list[str]) -> "ToolRegistry":
         """按 Loop 声明的 required_tools 按需实例化工具。"""
+        from engine.tools.browser import ChromeBrowserCapability
         from engine.tools.claude_tool import ClaudeTool
         from engine.tools.imap_tool import IMAPTool
         from engine.tools.smtp_tool import SMTPTool
@@ -45,6 +48,7 @@ class ToolRegistry:
 
         return cls(
             claude=_safe_build("claude", ClaudeTool) if "claude" in required else None,
+            browser=_safe_build("browser", ChromeBrowserCapability) if "browser" in required else None,
             imap=_safe_build("imap", IMAPTool) if "imap" in required else None,
             smtp=_safe_build("smtp", SMTPTool) if "smtp" in required else None,
             telegram=_safe_build("telegram", TelegramTool) if "telegram" in required else None,
