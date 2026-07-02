@@ -412,8 +412,8 @@ def main():
     )
     parser.add_argument(
         "--provider", choices=["kugou", "spotify"],
-        default=os.environ.get("MUSIC_PROVIDER", "spotify"),
-        help="音乐源（默认 spotify；可用 MUSIC_PROVIDER 环境变量覆盖）",
+        default=os.environ.get("MUSIC_PROVIDER", "kugou"),
+        help="音乐源（默认 kugou；可用 MUSIC_PROVIDER 环境变量覆盖）",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
