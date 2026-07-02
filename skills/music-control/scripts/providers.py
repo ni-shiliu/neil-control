@@ -2,13 +2,13 @@
 """music-cli provider 抽象层：KuGouProvider / SpotifyProvider。"""
 import os
 import json
-import hashlib
 import platform
 import subprocess
 import time
 import uuid
 import urllib.request
 import urllib.parse
+from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -42,84 +42,156 @@ class MusicProvider(ABC):
         return None
 
 
-# ── KuGou ─────────────────────────────────────────────────────────────────────
-_KUGOU_MENU = {
-    MR_CMD_NEXT:   "下一首",
-    MR_CMD_PREV:   "上一首",
-    MR_CMD_TOGGLE: "播放/暂停",
-    MR_CMD_PLAY:   "播放/暂停",
-    MR_CMD_PAUSE:  "播放/暂停",
-}
+# ── KuGou：macOS Accessibility 后台桥 ─────────────────────────────────────────
+_KUGOU_AX_SOURCE = Path(__file__).with_name("kugou_ax.m")
+_KUGOU_AX_BINARY = Path.home() / ".cache" / "music-cli" / "kugou-ax"
+_KUGOU_APP = Path("/Applications/KugouMusic.app")
 
 
-def _mr_send(cmd: int) -> bool:
-    import ctypes
-    path = "/System/Library/PrivateFrameworks/MediaRemote.framework/Versions/Current/MediaRemote"
+def _ensure_kugou_ax() -> Optional[Path]:
+    """按需编译原生 AX 桥；不依赖 PyObjC、私有 MediaRemote 或酷狗网络接口。"""
     try:
-        lib = ctypes.CDLL(path)
-        lib.MRMediaRemoteSendCommand.argtypes = [ctypes.c_int, ctypes.c_void_p]
-        lib.MRMediaRemoteSendCommand.restype  = ctypes.c_bool
-        return bool(lib.MRMediaRemoteSendCommand(cmd, None))
-    except OSError:
+        if (
+            _KUGOU_AX_BINARY.exists()
+            and _KUGOU_AX_BINARY.stat().st_mtime >= _KUGOU_AX_SOURCE.stat().st_mtime
+        ):
+            return _KUGOU_AX_BINARY
+        _KUGOU_AX_BINARY.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [
+                "xcrun", "clang", "-fobjc-arc",
+                "-framework", "AppKit",
+                "-framework", "ApplicationServices",
+                str(_KUGOU_AX_SOURCE), "-o", str(_KUGOU_AX_BINARY),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return _KUGOU_AX_BINARY if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _run_kugou_ax(binary: Path, args: tuple[str, ...]) -> dict:
+    try:
+        result = subprocess.run(
+            [str(binary), *args],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        return json.loads(result.stdout) if result.stdout.strip() else {
+            "ok": False, "error": "ax_helper_no_output",
+        }
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {"ok": False, "error": "ax_helper_failed"}
+
+
+def _launch_kugou() -> bool:
+    """正常打开酷狗；仅首次启动可见，后续操作仍保持后台。"""
+    if not _KUGOU_APP.exists():
         return False
+    try:
+        result = subprocess.run(
+            ["open", "-a", str(_KUGOU_APP)],
+            capture_output=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _kugou_ax(*args: str) -> dict:
+    binary = _ensure_kugou_ax()
+    if not binary:
+        return {"ok": False, "error": "ax_helper_build_failed"}
+
+    data = _run_kugou_ax(binary, args)
+    if data.get("error") != "kugou_not_running":
+        return data
+    if not _launch_kugou():
+        return data
+
+    transient_errors = {
+        "kugou_not_running",
+        "search_field_not_found",
+        "control_not_found",
+        "no_player",
+    }
+    for _ in range(24):
+        time.sleep(0.5)
+        data = _run_kugou_ax(binary, args)
+        if data.get("ok") or data.get("error") not in transient_errors:
+            return data
+    return data
 
 
 class KuGouProvider(MusicProvider):
     name = "kugou"
     proc_name = "KugouMusic"
 
+    def prepare_search(self, keyword: str) -> dict:
+        """后台写入搜索词并触发联想；最终提交由 Computer Use 发送 Return。"""
+        return _kugou_ax("search", keyword)
+
     def search(self, keyword: str, page_size: int = 8, page: int = 1) -> list:
-        try:
-            params = urllib.parse.urlencode({
-                "keyword": keyword, "page": page,
-                "pagesize": page_size, "showtype": 1,
-            })
-            req = urllib.request.Request(
-                f"http://mobilecdn.kugou.com/api/v3/search/song?{params}",
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode())
-            return [
-                {
-                    "title":    s.get("songname", ""),
-                    "artist":   s.get("singername", ""),
-                    "album":    s.get("album_name", ""),
-                    "id":       s.get("hash", ""),
-                    "duration": int(s.get("duration", 0)),
-                }
-                for s in data.get("data", {}).get("info", [])
-            ]
-        except Exception:
+        # KuGou's search WebView needs a real UI key event. The skill handles
+        # that through Computer Use, then this provider can read the page.
+        data = _kugou_ax("results")
+        if not data.get("ok"):
             return []
+        results = []
+        for item in data.get("results", [])[:page_size]:
+            parts = [p for p in item.get("parts", []) if p.lower() != "mv"]
+            if len(parts) < 3:
+                continue
+            duration_text = parts[0]
+            try:
+                minutes, seconds = duration_text.split(":", 1)
+                duration = int(minutes) * 60 + int(seconds)
+            except (ValueError, TypeError):
+                duration = 0
+            if len(parts) >= 4:
+                album, artist, title = parts[1], parts[2], "".join(parts[3:])
+            else:
+                album, artist, title = "", parts[1], parts[2]
+            results.append({
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "id": f"ax-result:{item.get('index', len(results))}",
+                "duration": duration,
+            })
+        return results
 
     def play_song(self, song_id: str) -> tuple:
-        if not song_id:
-            return False, ""
-        for url in [
-            f"mackugou://play?hash={song_id}",
-            f"mackugou://openurl?hash={song_id}",
-            f"kugou://play?hash={song_id}",
-        ]:
-            if subprocess.run(["open", url], capture_output=True).returncode == 0:
-                return True, url
-        return False, ""
+        # Result-row playback is intentionally handled by Computer Use in the
+        # skill. KuGou reports successful AXPress calls that do not play.
+        return False, song_id
 
     def control(self, mr_cmd: int) -> bool:
-        return self._menu_control(mr_cmd) or _mr_send(mr_cmd)
+        action = {
+            MR_CMD_NEXT: "next",
+            MR_CMD_PREV: "prev",
+            MR_CMD_TOGGLE: "toggle",
+            MR_CMD_PLAY: "play",
+            MR_CMD_PAUSE: "pause",
+        }.get(mr_cmd)
+        return bool(action and _kugou_ax("control", action).get("ok"))
 
-    def _menu_control(self, mr_cmd: int) -> bool:
-        item = _KUGOU_MENU.get(mr_cmd)
-        if not item:
-            return False
-        script = (
-            'tell application "System Events"\n'
-            f'  tell process "{self.proc_name}"\n'
-            f'    click menu item "{item}" of menu "播放控制" of menu bar 1\n'
-            '  end tell\n'
-            'end tell'
-        )
-        return subprocess.run(["osascript", "-e", script], capture_output=True).returncode == 0
+    def status(self) -> Optional[dict]:
+        data = _kugou_ax("status")
+        if not data.get("ok"):
+            return None
+        return {
+            "title": data.get("title", ""),
+            "artist": data.get("artist", ""),
+            "album": data.get("album", ""),
+            "playing": data.get("playing", False),
+            "source": "kugou_accessibility",
+        }
 
 
 # ── Spotify ───────────────────────────────────────────────────────────────────
