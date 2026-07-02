@@ -1,6 +1,6 @@
 ---
 name: music-control
-description: "Autonomously control music playback on macOS (KuGou or Spotify). PROACTIVELY plays music matching the conversation vibe — focused, relaxed, hyped or debug. Responds to explicit requests like play Jay Chou or play something relaxing. Always prefer taking action over asking."
+description: "Autonomously control music playback on macOS, using KuGou by default and Spotify only when explicitly requested. PROACTIVELY plays music matching the conversation vibe — focused, relaxed, hyped or debug. Responds to requests like play Jay Chou or play something relaxing. Always prefer taking action over asking."
 ---
 
 # music-control
@@ -41,7 +41,8 @@ $MUSIC [--provider kugou|spotify] <command>
 | `queue-next` | Skip to next in queue |
 | `queue-clear` | Clear the queue |
 
-`--provider` defaults to `spotify`. If Spotify is not running, it will be launched automatically. Set `MUSIC_PROVIDER=kugou` to use KuGou instead.
+`--provider` defaults to `kugou`. Use Spotify only when the user explicitly
+requests it or sets `MUSIC_PROVIDER=spotify`.
 
 ## KuGou Background Workflow
 
@@ -102,7 +103,7 @@ python3 scripts/music_cli.py --provider kugou prev
 | User says they fixed a bug / shipped | `recommend hyped` → play top result |
 | User is frustrated / stuck | `recommend debug` |
 | User mentions needing to relax | `recommend relaxed` |
-| User mentions a specific song or artist | `play-by <song> <artist>` |
+| User mentions a specific song or artist | Use the KuGou background workflow |
 | Long silence / idle in conversation | `recommend relaxed` |
 | User asks "play something" with no detail | Infer from recent conversation mood |
 
