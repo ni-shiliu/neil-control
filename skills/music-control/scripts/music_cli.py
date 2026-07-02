@@ -12,7 +12,7 @@ import urllib.parse
 from typing import Optional
 
 from providers import (
-    MusicProvider, SpotifyProvider, get_provider,
+    MusicProvider, KuGouProvider, SpotifyProvider, get_provider,
     MR_CMD_PLAY, MR_CMD_PAUSE, MR_CMD_TOGGLE, MR_CMD_NEXT, MR_CMD_PREV,
 )
 
@@ -206,6 +206,17 @@ def cmd_search(args):
     else:
         err(f"搜索无结果：{query}", "no_results")
     return 0
+
+
+def cmd_prepare_search(args):
+    provider = args.provider_obj
+    if not isinstance(provider, KuGouProvider):
+        err("prepare-search 仅用于酷狗后台搜索", "unsupported_provider")
+        return 1
+    query = " ".join(args.query)
+    result = provider.prepare_search(query)
+    out({"provider": provider.name, **result})
+    return 0 if result.get("ok") else 1
 
 
 def cmd_recommend(args):
@@ -419,6 +430,9 @@ def main():
     sch.add_argument("query", nargs="+")
     sch.add_argument("--page", type=int, default=1, help="分页页码（默认 1）")
 
+    prep = sub.add_parser("prepare-search", help=argparse.SUPPRESS)
+    prep.add_argument("query", nargs="+")
+
     pb = sub.add_parser("play-by", help="搜索并播放（支持多首，用 ||| 分隔）")
     pb.add_argument("title", nargs="+", help="歌名（可加艺术家，多首用 ||| 分隔）")
 
@@ -448,6 +462,7 @@ def main():
         "play":        cmd_play,
         "recommend":   cmd_recommend,
         "search":      cmd_search,
+        "prepare-search": cmd_prepare_search,
         "play-by":     cmd_play_by,
         "open":        cmd_play_by,
         "queue-show":  cmd_queue_show,
