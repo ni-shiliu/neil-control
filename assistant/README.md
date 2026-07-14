@@ -4,7 +4,7 @@
 
 你输入目标，系统负责解析、调度、执行、记录、通知，并在运行中维护受控记忆。
 
-架构设计、链路图、运行时边界请看 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+架构设计、链路图、运行时边界请看 [ARCHITECTURE.md](./architecture/RUNTIME.md)。
 
 ## 概览
 
@@ -354,9 +354,9 @@ class MyLoop(BaseLoop):
 - `extract_memory()`
 - `extract_goal_memory()`
 
-详细开发步骤请看 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+详细开发步骤请看 [ARCHITECTURE.md](./architecture/RUNTIME.md)。
 
 ## 文档
 
 - [README.md](./README.md)
-- [ARCHITECTURE.md](./ARCHITECTURE.md)
+- [ARCHITECTURE.md](./architecture/RUNTIME.md)
