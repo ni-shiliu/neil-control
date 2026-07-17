@@ -4,23 +4,56 @@
 
 ## 1. 架构定位
 
-这不是"Prompt + 工具"的聊天循环，而是一个**受控的 Agent 运行时**：
+这不是"Prompt + 工具"的聊天循环，而是一套由六层职责边界组成的**受控 Agent Harness**：
 
 - Agent 产品声明身份、知识策略、Skill 与申请的能力；
 - Task 与 Plan 描述需要长期推进的工作；
-- Harness 让工作以可控、可恢复、可审计的方式运行和交付。
+- Harness 让工作以可控、可恢复、可审计的方式运行和交付；其内核以受治理的执行循环推进单个 Agent Run。
 
-模型可以提出下一步动作，但永远不拥有最终执行权限。
+模型可以提出下一步动作，但永远不拥有最终执行权限；⑤ 层决定能否继续和能否执行，⑥ 层只执行已批准的动作。
 
 ## 2. 六层架构
 
-六层是职责边界，不意味着要拆成六个服务；运行时允许在 Runtime 与能力执行之间多轮往返。
+六层是职责边界，不意味着要拆成六个服务，也不是一次从 ① 到 ⑥ 后就结束的线性管道。一次渠道请求先经过 ①–③ 确定 Agent、持久化工作与委派，再进入由 ④、⑤、⑥ 组成的受控执行循环；循环结束后，③ 汇总结果，② 记录可追溯事实。
 
 ![标准 Harness Agent 架构图](assets/architecture.svg)
 
-> 左栏为接入渠道与 Agent 产品，中间六层横带自上而下是**控制流（①→⑥）**、橙色弧线是**证据回流（⑥→④）**，右栏三块为横切平面（全层可读写）。
+> 左栏为接入渠道与 Agent 产品；①–③ 是请求、Task 与委派控制流，④–⑥ 是 Harness 内核的受控执行循环。橙色弧线表示 ⑥ 的 Observation / Artifact / Effect 结果回流给 ④；⑤ 可拒绝、暂停或因预算耗尽而把控制权交回 ③ 与 ②。右栏三块为全层可读写的横切平面。
 
-### 2.1 每层的唯一职责
+### 2.1 两条控制流
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'primaryTextColor':'#1E1B4B','lineColor':'#94A3B8','fontFamily':'Inter, sans-serif'}}}%%
+flowchart TB
+    IN["渠道输入"]:::edge --> A1["① Agent 路由"]:::agent
+    A1 --> T2["② Task / Plan"]:::task
+    T2 --> O3["③ 编排 / WorkOrder"]:::orch
+
+    subgraph CORE["Harness 内核：受控执行循环"]
+        direction LR
+        R4["④ Runtime<br/>决策"]:::runtime --> G5{"⑤ 治理<br/>裁决"}:::gate
+        G5 -->|"已授权动作"| C6["⑥ 能力<br/>执行"]:::cap
+        C6 -. "Observation / 证据" .-> R4
+    end
+
+    O3 --> R4
+    G5 -->|"终态输出"| DONE["③ 汇总<br/>② Run / Artifact"]:::done
+    G5 -->|"拒绝 / 暂停 / 预算耗尽"| PAUSE["③ 编排<br/>② checkpoint"]:::pause
+
+    classDef edge fill:#E0F2FE,stroke:#0284C7,color:#0C4A6E;
+    classDef agent fill:#EEF4FF,stroke:#3B82F6,color:#1E3A5F;
+    classDef task fill:#DCFCE7,stroke:#16A34A,color:#14532D;
+    classDef orch fill:#FEF3C7,stroke:#D97706,color:#78350F;
+    classDef runtime fill:#EDE9FE,stroke:#7C3AED,color:#3B0764;
+    classDef gate fill:#FFE4E6,stroke:#E11D48,color:#881337;
+    classDef cap fill:#CCFBF1,stroke:#0F766E,color:#134E4A;
+    classDef done fill:#DCFCE7,stroke:#16A34A,color:#14532D;
+    classDef pause fill:#FFF7ED,stroke:#EA580C,color:#7C2D12;
+```
+
+`Harness.handle()` 可以是渠道侧的全链路单入口，但不等同于模型/动作循环本身：它负责把请求交给各层；单 Agent Run 的多轮决策、裁决、执行和观察发生在 ④–⑥。
+
+### 2.2 每层的唯一职责
 
 | 层 | 负责什么 | 不负责什么 |
 |---|---|---|
@@ -74,7 +107,7 @@ flowchart TB
 | 组件 | 字段 | 回答 | 内容 | 边界 |
 |---|---|---|---|---|
 | **身份 Profile** | `identity` | 是谁 | Agent 的角色定位、语气人格、目标边界、面向的任务类型 | 只定义"我是谁"，不含权限 |
-| **知识策略** | `knowledge_policy` | 知道什么 | 声明可读写哪些知识域（共享规则 / 专属知识 / 项目证据 / 记忆），而非塞一份大 Prompt | 只声明可访问范围，检索由 ④ 层执行 |
+| **知识策略** | `knowledge_policy` | 知道什么 | 声明 `conversation`、`memory.user`、`memory.project`、`personal_config` 等可读写域，而非塞一份大 Prompt | 只声明可访问范围，检索由 ④ 层执行 |
 | **Skill 授权** | `skill_grants` + `capability_grants` | 能用什么 | 授予哪些 Skill 与底层能力（网络、文件、发送等） | 只**声明**授权，实际裁决在 ⑤ 层 |
 | **工作流模板** | `workflow_template` | 怎么干活 | 该产品的默认推进骨架（如"写→审→交付"），作为 ②/③ 层生成 Plan 的起点 | 是模板不是硬编码，运行时可被 `PlanPatch` 调整 |
 
@@ -103,7 +136,8 @@ flowchart TB
 | 共享核心规则 | 安全、输出规范、平台行为 | 所有 Agent 都可使用 |
 | Agent 专属知识 | 剧本结构、品牌语气、工具手册 | 由 `knowledge_policy` 选择 |
 | Task / 项目证据 | 角色 bible、当前剧本、历史审查意见 | 通过版本化 Artifact 精确引用 |
-| 用户与会话记忆 | 偏好、活跃对话上下文 | 受用户、Task 和保留规则限制 |
+| Conversation / 用户记忆 | 最近会话记录、稳定偏好 | 分别受 thread 保留期与用户写入策略限制 |
+| 项目记忆 / 个人配置 | 项目派生事实、用户明确设置 | 仅在对应 Agent 策略和可信身份允许时读取 |
 
 ### 3.2 ② Task 与 Plan 层：持久化领域对象
 
@@ -236,25 +270,64 @@ flowchart TB
     classDef comp fill:#F5F3FF,stroke:#8B5CF6,color:#3B0764;
 ```
 
+#### Harness 内核：受控 Agent 执行循环
+
+④–⑥ 共同构成一次单 Agent `Run` 的内核；它是运行时允许多轮往返的唯一位置，而不是 ③ 层 DAG 调度的 `while`。每一轮都遵循同一条稳定路径：
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'primaryTextColor':'#1E1B4B','lineColor':'#94A3B8','fontFamily':'Inter, sans-serif'}}}%%
+flowchart LR
+    R["④ Runtime<br/>最小上下文 + 模型决策"]:::runtime -->|"回复或动作提议"| G{"⑤ 继续 / 授权<br/>Guardrail / 预算"}:::gate
+    G -->|"已批准动作"| C["⑥ Capability<br/>执行 Skill / 工具"]:::cap
+    C -->|"Observation / Artifact / Effect 结果"| R
+    G -->|"终态输出"| DONE["交付结果"]:::done
+    G -->|"拒绝 / 暂停 / 预算耗尽"| OUT["③ 编排 + ② checkpoint"]:::pause
+
+    classDef runtime fill:#EDE9FE,stroke:#7C3AED,color:#3B0764;
+    classDef gate fill:#FFE4E6,stroke:#E11D48,color:#881337;
+    classDef cap fill:#CCFBF1,stroke:#0F766E,color:#134E4A;
+    classDef done fill:#DCFCE7,stroke:#16A34A,color:#14532D;
+    classDef pause fill:#FFF7ED,stroke:#EA580C,color:#7C2D12;
+```
+
+1. ④ 按 Agent 身份、知识策略、Task / WorkOrder 和上一轮 Observation 组装最小上下文，并让模型产出终态回复或**动作提议**。
+2. ⑤ 对每次继续和每个动作作确定性裁决：检查预算、无进展与重复，执行 Guardrail 和授权；它可以允许、拒绝、暂停或结束本次 Run。
+3. ⑥ 只执行获准的 Skill、工具或交付操作，返回结构化 Observation、Artifact 引用或 Effect 结果；它不自行选择下一步。
+4. ④ 消费这些结果后再决策，直到 ⑤ 放行终态输出，或把拒绝、失败、暂停和预算耗尽交回 ③/② 汇总、checkpoint 与恢复。
+
+因此模型既不能直接执行能力，也不能直接修改全局 TaskPlan：前者必须穿过 ⑤→⑥，后者只能通过类型化 `PlanPatch` 回到 ② 层校验。
+
+#### 上下文预算：⑤触发，④压缩
+
+每次模型调用前，⑤必须对**完整请求**计数：system prompt、全部 `RuntimeState.messages` 和当前 tool schema 均在范围内。默认窗口为 1M tokens，固定预留 32k 输出空间，所以输入硬上限是 968k：
+
+```text
+< 800k       → 允许④调用模型
+800k–968k    → ⑤要求④执行滚动压缩，再次计数
+≥ 968k       → 禁止直接调用模型；压缩与强制裁剪后才可重试
+```
+
+④的 `RuntimeCompactor` 只折叠本 Run 已完成的历史与 Observation，产出带目标、约束、决策、工具结果/Artifact 引用、未解决项和下一步的 `RunSummary`。它不会改写 Conversation、用户/项目记忆或 Task 事实。当前用户输入、Task/WorkOrder 验收条件、system/Skill、未完成工具事务以及 Artifact/Effect 引用是受保护锚点；若当前输入本身过大，原文仍保留在 `RunRequest`，④按块生成临时输入摘要。压缩事件及其 token 前后值写入 RunJournal；Task Run 同时写 checkpoint。
+
 其中最难的是上下文工程，展开如下。
 
-记忆平面（§4.2）回答"存什么、谁能读"，上下文工程回答"每一步实际喂给模型哪些 token"——这是 ④ 层组装工作记忆的核心职责。上下文是有限资源，token 越多召回越差（context rot），目标始终是**信噪比最高的最小 token 集**。
+记忆与会话平面（§4.1）回答"存什么、谁能读"，上下文工程回答"每一步实际喂给模型哪些 token"——这是 ④ 层组装工作记忆的核心职责。上下文是有限资源，token 越多召回越差（context rot），目标始终是**信噪比最高的最小 token 集**。
 
 长周期任务必然超出单次上下文窗口，需要三种可组合策略：
 
 | 策略 | 做法 | 何时用 |
 |---|---|---|
-| 压缩 | 近上限时摘要历史、重建窗口，但保留架构决策、验收标准、未解决问题；最轻量形式是清理已消费的工具结果 | 高频来回的对话式推进 |
+| 窗口裁剪 | Conversation 只取最近 8 回合；当前 Run 只保留必要 Observation，超预算时淘汰低优先级内容 | 高频来回的对话式推进 |
 | 结构化笔记 | 里程碑写入持久笔记（`NOTES.md`、待办），按需拉回，而非全靠窗口记住 | 达成里程碑、跨 Run 续接 |
 | 子 Agent 隔离 | 子 Agent 用干净上下文做子任务，只回传 1~2K token 摘要，而非全部中间过程 | 并行调研、多节点协作 |
 
 按需检索优于预加载：④ 层应通过轻量标识符（Artifact 引用、记忆 scope、文件路径）**渐进式加载**上下文，而非开局就把整个角色 bible 灌进 Prompt——这与 §3.1"知识是策略，不是巨型 Prompt"是同一反模式的两面。
 
-三种策略都不得丢弃**可追溯性**：被压缩的原始事实仍以 Artifact 留在证据平面，摘要保留 `source_ref` 回链。
+这些策略都不得丢弃**可追溯性**：Task / Plan / Run / Artifact 仍是事实源；长期记忆保留 `source_ref` 回链。Conversation 不做自动摘要或自动晋升。
 
 ### 3.5 ⑤ 运行控制与治理层：Agent 自主性外侧的确定性边界
 
-第 ⑤ 层是 Agent 自主性外侧的确定性边界。它有四项核心职责：
+第 ⑤ 层是 Agent 自主性外侧的确定性边界。它不是从 ④ 到 ⑥ 的一次性线性步骤，而是 ④–⑥ 内循环每一轮的控制闸门：首个模型调用前可拦截输入；模型提出动作后决定是否放行；返回结果后决定是否继续、收口或暂停。它有四项核心职责：
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryTextColor':'#1E1B4B','lineColor':'#94A3B8','fontFamily':'Inter, sans-serif'}}}%%
@@ -273,7 +346,7 @@ flowchart TB
 
 | 关注点 | 示例 | 决策 |
 |---|---|---|
-| 运行安全 | 最大轮数、执行时间、工具调用预算、无进展阈值、重复动作/结果、委派深度 | 继续、收口、暂停、取消 |
+| 运行安全 | 最大轮数、执行时间、工具调用预算、上下文 token 预算、无进展阈值、重复动作/结果、委派深度 | 继续、压缩、收口、暂停、取消 |
 | 治理与授权 | 身份、能力范围、数据敏感度、收件人/域名规则、审批策略 | 允许、拒绝、要求审批 |
 
 #### Guardrail：入口与出口双向拦截
@@ -351,7 +424,7 @@ flowchart TB
 
 ### 3.6 ⑥ 能力与交付层：Skill、工具与副作用
 
-第 ⑥ 层实现具体能力，**只执行，不决定动作是否被允许**（那是 ⑤ 层的事）。它有四项核心职责：
+第 ⑥ 层实现具体能力，**只执行，不决定动作是否被允许**（那是 ⑤ 层的事）。每次执行都必须把结构化 Observation、Artifact 引用或 Effect 结果交回 ④，作为下一轮上下文的证据；它有四项核心职责：
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryTextColor':'#1E1B4B','lineColor':'#94A3B8','fontFamily':'Inter, sans-serif'}}}%%
@@ -409,7 +482,7 @@ flowchart LR
     subgraph PLANE[三大横切平面]
       direction TB
       S["💾 数据与证据<br/>Task·Plan·Run·Artifact<br/>Effect·checkpoint"]:::data
-      M["🧠 记忆与知识<br/>用户·Agent·项目·Task·会话<br/>知识索引"]:::mem
+      M["🧠 上下文与记忆<br/>Conversation·用户·项目·个人配置"]:::mem
       V["📊 观测与评测<br/>trace·审计·成本<br/>回放·场景评测·门禁"]:::obs
     end
 
@@ -423,7 +496,7 @@ flowchart LR
 | 平面 | 保存什么 | 为什么需要 |
 |---|---|---|
 | 💾 数据与证据 | Task、Plan、Run、WorkOrder、Artifact、Effect、checkpoint | 恢复、溯源、审批、可复现 |
-| 🧠 记忆与知识 | 用户、Agent、项目、Task、会话记忆；知识索引与访问策略 | 个性化、连续性、可控复用与知识隔离 |
+| 🧠 上下文与记忆 | Conversation、用户记忆、项目记忆、个人配置及其访问策略 | 个性化、连续性、可控复用与知识隔离 |
 | 📊 观测与评测 | 结构化事件、trace、模型/工具版本、token/cost、场景集、回放报告 | 排障、审计、安全升级模型/Prompt/Skill |
 
 三者是有层次的：**数据与证据是原始事实，记忆是其派生，观测记录整个过程。**
@@ -448,41 +521,47 @@ flowchart LR
 
 `Artifact` 是可追溯的原始事实和产物；`Memory` 是从中提炼、可检索可纠正的派生认知。记忆不能替代 Artifact 作事实源，须保留 `source_ref` 回链。
 
-### 4.1 记忆与知识平面
+### 4.1 上下文、会话与记忆
 
-记忆按**作用域与生命周期分层**，呈包含关系——外层范围越大、生命周期越长，把内层更短命的记忆包住；不能把所有聊天、模型输出、工具结果都无脑写成长时记忆。
+不要把聊天记录、临时状态和长期记忆混成一个库。下图按 Runtime 从外到内缩小上下文范围的顺序表达五层；图中的包含关系表示**本次 Run 可见范围**，不是文件目录或数据所有权关系：
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryTextColor':'#1E1B4B','lineColor':'#94A3B8','fontFamily':'Inter, sans-serif'}}}%%
 flowchart TB
-    subgraph P["项目 / Task 记忆　·　一个项目或 Task（角色关系·剧情事实·决策·失败原因）"]
-      subgraph A["Agent 记忆　·　某 Agent 跨 Task（已验证方法·可复用风格）"]
-        subgraph U["用户记忆　·　跨会话（语言偏好·审批习惯·稳定偏好）"]
-          subgraph T["会话记忆　·　一个 thread（近期对话·在讨论的方案）"]
-            R["工作记忆　·　单个 Run<br/>工具结果·阶段摘要·临时上下文"]:::inner
-          end
+    subgraph CONFIG["个人配置（可选）"]
+        subgraph PROJECT["项目记忆（可选）"]
+            subgraph USER["用户记忆（可选）"]
+                subgraph CONVERSATION["Conversation（可选）"]
+                    RUN["工作记忆（必有）<br/>RuntimeState"]:::run
+                end
+            end
         end
-      end
     end
 
-    classDef inner fill:#FDBA74,stroke:#EA580C,color:#7C2D12;
-    style P fill:#FFF7ED,stroke:#EA580C,color:#7C2D12;
-    style A fill:#FFEDD5,stroke:#F97316,color:#7C2D12;
-    style U fill:#FFE4CC,stroke:#FB923C,color:#7C2D12;
-    style T fill:#FFF0DC,stroke:#FDBA74,color:#7C2D12;
+    POLICY["Agent knowledge_policy<br/>+ 可信请求身份"]:::gate
+    POLICY -.-> CONFIG
+
+    classDef run fill:#EDE9FE,stroke:#7C3AED,color:#3B0764;
+    classDef gate fill:#FEF3C7,stroke:#D97706,color:#78350F;
+    style CONFIG fill:#F0FDF4,stroke:#16A34A,color:#14532D;
+    style PROJECT fill:#FFF7ED,stroke:#EA580C,color:#7C2D12;
+    style USER fill:#FFEDD5,stroke:#F97316,color:#7C2D12;
+    style CONVERSATION fill:#E0F2FE,stroke:#0284C7,color:#0C4A6E;
 ```
 
-> 从内到外：生命周期越来越长（单次 Run → 永久项目事实），作用域越来越广（一个 Run → 整个项目）。内层记忆是外层的短命子集。
+个人配置由用户或宿主明确设置，模型不能自动改写；项目记忆仅 project Agent 且有 `project_id` 时可用；用户记忆保存跨会话稳定偏好；Conversation 只取当前 thread 最近 8 回合；工作记忆保存当前 Run 的 Observation 和临时状态。CLI `chat` Agent 展开个人配置 → 用户记忆 → Conversation → 工作记忆，跳过项目记忆层。
 
-每条记忆至少应拥有以下契约：
+这些不是每个渠道都有的固定五层。渠道提供可信 `tenant_id / user_id / thread_id`，可选 `project_id`；**Agent 的 `knowledge_policy` 决定该 Agent 对本次渠道可读写哪些域。** 例如 CLI 的 `chat` Agent 只读 `conversation`、`memory.user`、`personal_config`，不声明也不读取 `memory.project`。没有 project 身份或未获授权时，项目记忆不会进入上下文。目录结构、保留期与 token 预算统一见本节后面的“本地 Harness 存储约定”。
+
+长期记忆的共同契约如下；首期 scope 仅为 `user` 与 `project`：
 
 ```python
 @dataclass(frozen=True)
 class MemoryRecord:
-    scope: str          # user / agent / project / task / thread / run
-    kind: str           # preference / fact / decision / episode / summary
+    scope: str          # user / project
+    kind: str           # preference / fact / decision / summary
     content: dict
-    source_ref: str     # 对应 Artifact、Run 或用户输入
+    source_ref: str     # conversation、TaskPlan、Artifact、Run 等来源
     confidence: float
     sensitivity: str
     ttl: str | None
@@ -490,23 +569,16 @@ class MemoryRecord:
     write_policy: str
 ```
 
-记忆的读写规则按层划分：
+读写边界：①层声明 `knowledge_policy`；④层只按授权检索最小上下文；⑤层检查租户、scope、来源与写入策略；⑥层由模型提出记忆更新。`MemoryProposal` 只存在于当前 Run 内存，`MemoryService` 校验后按语义键覆盖 Markdown 的当前值。个人配置没有模型写入 Skill。
 
-- ① 层的 `knowledge_policy` 声明 Agent 可读写哪些记忆域；
-- ② 层维护项目和 Task 的决策记忆；
-- ③ 层只共享 WorkOrder 所需的最小记忆，不把 Agent 上下文全部互相注入；
-- ④ 层按 scope 检索记忆并组装工作记忆；
-- ⑤ 层强制租户隔离、隐私、保留期限和写入权限；
-- ⑥ 层 Skill 只能产出"候选记忆"，不能绕过记忆服务直接写入全局事实。
-
-影响项目事实的记忆不能直接落库，须经校验才能**晋升**为长期记忆；冲突、失效、用户纠正都保留版本记录：
+影响项目事实的记忆不能直接落库，须经校验才能写入对应的当前记忆文档；提案不会成为文件，用户纠正直接覆盖相同语义键：
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryTextColor':'#1E1B4B','lineColor':'#94A3B8','fontFamily':'Inter, sans-serif'}}}%%
 flowchart LR
-    C["候选记忆<br/>（⑥ 层 Skill 产出）"]:::cand --> G{"证据 / 确定性检查<br/>/ Reviewer 校验"}:::gate
-    G -->|通过| L["长期记忆<br/>带 source_ref 回链"]:::long
-    G -->|冲突 / 失效 / 被纠正| V["保留版本记录<br/>可回溯"]:::ver
+    C["内存提案<br/>（⑥ 层 Skill 产出）"]:::cand --> G{"权限 / 来源 / scope 校验"}:::gate
+    G -->|通过| L["Markdown 当前值<br/>按 semantic_key 覆盖"]:::long
+    G -->|拒绝| V["仅返回 Observation<br/>不写任何文件"]:::ver
 
     classDef cand fill:#FFF7ED,stroke:#F59E0B,color:#7C2D12;
     classDef gate fill:#FEF3C7,stroke:#D97706,color:#78350F;
@@ -514,20 +586,20 @@ flowchart LR
     classDef ver fill:#F1F5F9,stroke:#64748B,color:#0F172A;
 ```
 
-**校验通过≠原样落库。** 记忆库若把每条候选都堆进去，很快会膨胀、重复、自相矛盾。落库前须经一道**压缩**：同一 scope 下按 `kind` 归并——新证据合并进已有记忆、过期的降权或加 `ttl`、冲突的以高 `confidence`/新版本覆盖旧版本（旧版仍留版本记录）。这与 §3.4 的上下文压缩同源，但对象不同：
+**校验通过≠追加文件。** 同一个 `scope + owner + semantic_key` 永远只对应 Markdown 中一行当前值；模型判断需要更新时直接覆盖该行。会话记录保留原始对话，Task / Plan / Run / Artifact 保留任务事实，因此用户/项目记忆不再复制候选或版本历史。这与 §3.4 的上下文压缩同源，但对象不同：
 
 | | §3.4 上下文压缩 | §4.1 记忆落库压缩 |
 |---|---|---|
 | 压缩对象 | 喂给模型的 token 窗口 | 写入记忆库的长期记忆 |
-| 目的 | 单次运行的信噪比 | 记忆库不膨胀、不冲突 |
-| 触发 | 近上下文上限时 | 每次记忆晋升落库时 |
+| 目的 | 单次运行的信噪比 | 每个语义键只有一个当前值 |
+| 触发 | 近上下文上限时 | 每次成功记忆更新时 |
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'primaryTextColor':'#1E1B4B','lineColor':'#94A3B8','fontFamily':'Inter, sans-serif'}}}%%
 flowchart LR
-    N["通过校验的记忆"]:::cand --> Q{"同 scope+kind<br/>已有记忆?"}:::gate
-    Q -->|无| W["直接写入"]:::long
-    Q -->|有| C["压缩归并<br/>合并证据·覆盖冲突·降权过期"]:::comp
+    N["通过校验的内存提案"]:::cand --> Q{"同 scope + owner + key<br/>已有当前值?"}:::gate
+    Q -->|无| W["新增 Markdown 行"]:::long
+    Q -->|有| C["覆盖同一 Markdown 行"]:::comp
     C --> W
 
     classDef cand fill:#DCFCE7,stroke:#16A34A,color:#14532D;
@@ -536,7 +608,27 @@ flowchart LR
     classDef long fill:#EDE9FE,stroke:#7C3AED,color:#3B0764;
 ```
 
-压缩不得丢弃可追溯性：归并后仍保留各条的 `source_ref` 与被覆盖版本，随时可回溯到原始 Artifact。
+可追溯性不由记忆文件承担：对话从 Conversation JSONL 查询，任务事实从 Task / Plan / Run / Artifact / Checkpoint 查询。
+
+#### 本地 Harness 存储约定
+
+新 Harness 的 Conversation、长期记忆与个人配置都收口在 `harness/memory/` 或 `harness/config/`；旧 `engine/memory.py`、Loop / Goal memory 和 CLI 专属 `conversation_records` 不属于该路径：
+
+```text
+harness/memory/memory_store/
+  conversations/tenants/<tenant>/users/<user>/<YYYY-MM-DD>_<part>.jsonl
+  user/<tenant>/<user>.md
+  project/<tenant>/<project>.md
+
+harness/config/personal_store/
+  tenants/<tenant>/users/<user>.json
+```
+
+`ConversationRecord` 是不可变的短期会话记录，属于 `harness/memory/`：按租户、用户和日期分区、每条一行写入 append-only JSONL；每行以 `created_at` 开头，便于直接排查，`thread_id` 是记录字段，只在读取当前会话时过滤，**不参与目录结构**。单日段文件达到 8 MiB 后滚动新 part。记录还保存可查看的 `decision_trace`（模型动作提议、治理后执行结果与终态），供未来 CLI 检视；它不保存或展示模型私有思维链。④ 层只取当前 thread 最近 8 回合并限制在 2,400 tokens；它不会自动晋升为长期记忆。普通会话记录默认保留 30 天。`CandidateMemory` 只在当前 Run 内存中存在，成功或拒绝后立即丢弃。
+
+用户记忆在 `user/<tenant>/<user>.md`，项目记忆在 `project/<tenant>/<project>.md`：每份都是该 owner 的**唯一当前记忆文件**。Markdown 表格的每一行是 `key / kind / value`，读取时可直接编辑或新增；相同 key 的更新会覆盖原行。**是否需要记忆、保存什么语义键以及 `sensitivity` 分类均由 Agent 模型依据身份、当前表达和 Conversation 判断**；例如 chat Agent 通常会把清晰的姓名自我介绍视为稳定事实。Runtime 不按“我是/我叫”等句式创建记忆。代码不以 `low / normal / high` 或文本模式决定保存与否，只校验分类枚举、来源、Agent 授权、scope 和写入策略；它不能把推测自动写成用户记忆。
+
+上下文压缩与长期记忆更新必须分离：④ 层按 token 预算选择本次 Run 的最小上下文；记忆服务只按 `scope + owner + semantic_key` 更新当前 Markdown 行。会话记录只做窗口读取，不再额外维护 thread 长期记忆或自动摘要。
 
 ### 4.2 checkpoint 边界
 
@@ -595,19 +687,21 @@ flowchart TB
 
 ## 5. 本仓库的实现方向
 
-现有代码是有价值的参考，而不是目标架构本身：
+现有代码是迁移参考，而不是目标架构本身。新 Harness 的核心必须在 `harness/` 内拥有 ④–⑥ 的受控执行循环；旧 `engine` 只在迁移期提供行为参照与兼容支撑：
 
 | 现有组件 | 在目标架构中的位置 |
 |---|---|
-| `HarnessRunner`、`HarnessContextManager`、`RunPolicy` | ④ 层 Runtime，以及 ⑤ 层的运行安全部分 |
-| `ChatHarness` | `chat_assistant` 的一种渠道/产品适配 |
-| `BaseLoop`、`LoopEngine`、`scheduler.py` | ②/③ 层的早期 Task 推进与触发基础设施 |
+| `engine/harness.py::HarnessRunner` | 旧的模型→工具→结果内循环；待拆入新 Harness 的 ④ Runtime、⑤ 控制闸门与 ⑥ 执行端口 |
+| `HarnessContextManager`、`RunPolicy` | ④ 层上下文工程与 ⑤ 层运行安全的遗留参考；`RunPolicy` 必须随 Run 持久化 |
+| `ChatHarness` | 旧聊天适配；目标是由 ① 的 `chat` Agent 包与共享 Harness 承担产品差异 |
+| `BaseLoop`、`LoopEngine`、`scheduler.py` | 独立的旧外部触发/推进机制，不是新 Harness 的单 Agent 执行内循环；后续单独迁移或删除 |
 | `effects.py` | ⑥ 层的第一版 Effect / outbox 实现 |
-| memory | 记忆与知识平面的起点；需要补 scope、来源、版本与读写策略 |
-| run records、conversation records | 数据与证据平面的起点 |
-| `engine/tools/*` | Skill Registry 下方的能力适配器 |
+| `harness/memory/` | 已实现会话 JSONL、用户/项目单 Markdown 当前记忆，以及仅运行期存在的记忆提案 |
+| `harness/memory/conversation/` | 已实现按租户、用户、日期分区的短期会话记录；thread 只用于读取过滤，不作为目录 |
+| `harness/config/` | 已实现用户或宿主维护的个人配置；模型无自动写入权 |
+| 旧 `engine/tools/*` | 已迁移或待迁移到 Skill Registry 下方的能力适配器 |
 
-第一个实现里程碑不是多 Agent，而是定义持久化契约：`AgentDefinition`、`Task`、`Plan`、`Run`、`Artifact`、`Effect`、`WorkOrder`，然后让现有单 Agent Harness 使用它们。多 Agent 协作应是同一套契约上的受控扩展。
+迁移顺序是：先稳定持久化契约 `AgentDefinition`、`Task`、`Plan`、`Run`、`Artifact`、`Effect`、`WorkOrder`；再让新 Harness 在 ④–⑥ 中承载受控执行循环；最后才在同一套契约上扩展多 Agent 协作。外部 Loop 的替换不属于当前 Harness 内核工作。
 
 ## 6. 不可妥协的规则
 

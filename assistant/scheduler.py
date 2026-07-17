@@ -242,7 +242,7 @@ def _register(goal: dict) -> None:
 def _register_event(goal: dict) -> None:
     """event 模式：启动 IMAP IDLE 监听线程。"""
     try:
-        from engine.tools.imap_tool import IMAPTool
+        from harness.agents.tools.imap_tool import IMAPTool
         imap = IMAPTool()
         imap.idle_listen(lambda: _run_goal(goal["id"]))
         log.info(f"已启动 IMAP IDLE 监听 goal={goal['id']}")

@@ -197,7 +197,7 @@ Chrome -> View -> Developer -> Allow JavaScript from Apple Events
 也可以在命令行直接运行：
 
 ```bash
-python3.12 -m engine.tools.browser.diagnostics
+python3.12 -m harness.agents.tools.browser.diagnostics
 ```
 
 如果诊断中 `javascript_from_apple_events` 为 `disabled`，浏览器能力只能读取 URL/title，不能稳定读取 DOM、点击元素或输入文本。
@@ -255,6 +255,12 @@ CLI 基于 `prompt_toolkit`：
 | `memory/loops/*.json` | loop 级 memory |
 | `memory/goals/*.json` | goal 级 memory |
 | `run_records/<goal_id>_<loop_name>_<YYYY-MM-DD>.json` | 每日运行记录 |
+| `harness/tasks/task_store/tasks/<task_id>/` | 内部复杂 Task 的 Plan、Run、Artifact 与 checkpoint |
+| `harness/memory/memory_store/conversations/` | 新 Harness 按租户、用户与日期分区的 append-only JSONL 会话记录；thread 仅作读取过滤 |
+| `harness/memory/memory_store/user/<tenant>/<user>.md` | 新 Harness 的当前用户记忆；同 key 直接覆盖，不保留候选或版本文件 |
+| `harness/memory/memory_store/project/<tenant>/<project>.md` | 新 Harness 的当前项目记忆；仅 project Agent + project_id 可用 |
+| `harness/memory/memory_store/user/<tenant>/<user>.md` | 用户可直接编辑的用户记忆文档（key / kind / value） |
+| `harness/config/personal_store/` | 新 Harness 的用户个人配置（仅由用户或宿主写入） |
 | `effect_history.json` | effect 幂等历史 |
 | `assistant.log` | 运行日志 |
 

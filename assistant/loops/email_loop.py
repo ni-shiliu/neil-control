@@ -311,7 +311,7 @@ action 选项：
             emails = ctx.tools.imap.fetch_unseen(limit=self.max_emails)
         else:
             # 降级：直接用 IMAPTool（兼容旧测试）
-            from engine.tools.imap_tool import IMAPTool
+            from harness.agents.tools.imap_tool import IMAPTool
             emails = IMAPTool().fetch_unseen(limit=self.max_emails)
         return {"emails": emails, "memory": memory}
 

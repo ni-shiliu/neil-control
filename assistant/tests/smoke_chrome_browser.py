@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from engine.tools.browser import (  # noqa: E402
+from harness.agents.tools.browser import (  # noqa: E402
     BrowserAction,
     ChromeBrowserCapability,
     FinalizeOptions,

@@ -116,11 +116,14 @@ def build_chat_runtime_context(
     user_input: str,
     goals: list[dict[str, Any]],
     loops: dict[str, Any],
+    include_user_memory: bool = True,
+    include_recent_conversations: bool = True,
+    include_runtime_doc: bool = True,
 ) -> ChatRuntimeContext:
     """构建 CLI chat 的稳定上下文，不包含循环内 messages。"""
 
     recent_conversations: list[dict[str, Any]] = []
-    if conversation_recorder:
+    if include_recent_conversations and conversation_recorder:
         recent_conversations = conversation_recorder.list_recent(limit=10)
 
     return ChatRuntimeContext(
@@ -128,7 +131,7 @@ def build_chat_runtime_context(
         goals=goals,
         loops=loops,
         recent_conversations=recent_conversations,
-        user_memory=memory_store.load_user_memory(),
-        runtime_doc=load_runtime_doc(),
+        user_memory=memory_store.load_user_memory() if include_user_memory else {},
+        runtime_doc=load_runtime_doc() if include_runtime_doc else "",
         capability_catalog=build_capability_catalog(loops),
     )

@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from engine.context import ToolRegistry
-from engine.tools.browser import (
+from harness.agents.tools.browser import (
     BrowserAction,
     ChromeBrowserCapability,
     FinalizeOptions,
@@ -13,8 +13,8 @@ from engine.tools.browser import (
     TabInfo,
     WaitCondition,
 )
-from engine.tools.browser.diagnostics import render_browser_diagnostic, run_browser_diagnostic
-from engine.tools.browser.safety import BrowserSafetyError, validate_safe_action
+from harness.agents.tools.browser.diagnostics import render_browser_diagnostic, run_browser_diagnostic
+from harness.agents.tools.browser.safety import BrowserSafetyError, validate_safe_action
 
 
 class _FakeBridge:

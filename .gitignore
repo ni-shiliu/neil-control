@@ -39,5 +39,11 @@ assistant/RUNTIME.md
 assistant/memory/*.json
 assistant/memory/goals/
 assistant/memory/loops/
+assistant/harness/tasks/task_store/
+# Harness 用户运行数据：含对话、用户/项目记忆与个人配置，不提交代码仓库。
+assistant/harness/memory/memory_store/conversations/
+assistant/harness/memory/memory_store/user/
+assistant/harness/memory/memory_store/project/
+assistant/harness/config/personal_store/
 assistant/.venv/
 assistant/.venv312/

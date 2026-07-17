@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING
 from engine.effects import EffectCollector
 
 if TYPE_CHECKING:
-    from engine.tools.claude_tool import ClaudeTool
-    from engine.tools.browser import BrowserCapability
-    from engine.tools.imap_tool import IMAPTool
-    from engine.tools.smtp_tool import SMTPTool
-    from engine.tools.telegram_tool import TelegramTool
+    from harness.agents.tools.claude_tool import ClaudeTool
+    from harness.agents.tools.browser import BrowserCapability
+    from harness.agents.tools.imap_tool import IMAPTool
+    from harness.agents.tools.smtp_tool import SMTPTool
+    from harness.agents.tools.telegram_tool import TelegramTool
 
 
 log = logging.getLogger(__name__)
@@ -33,11 +33,11 @@ class ToolRegistry:
     @classmethod
     def build(cls, required: list[str]) -> "ToolRegistry":
         """按 Loop 声明的 required_tools 按需实例化工具。"""
-        from engine.tools.browser import ChromeBrowserCapability
-        from engine.tools.claude_tool import ClaudeTool
-        from engine.tools.imap_tool import IMAPTool
-        from engine.tools.smtp_tool import SMTPTool
-        from engine.tools.telegram_tool import TelegramTool
+        from harness.agents.tools.browser import ChromeBrowserCapability
+        from harness.agents.tools.claude_tool import ClaudeTool
+        from harness.agents.tools.imap_tool import IMAPTool
+        from harness.agents.tools.smtp_tool import SMTPTool
+        from harness.agents.tools.telegram_tool import TelegramTool
 
         def _safe_build(tool_name: str, factory):
             try:

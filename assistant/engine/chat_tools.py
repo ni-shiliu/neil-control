@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Set
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -276,13 +277,28 @@ TOOL_SCHEMAS: list[dict] = [
     },
 ]
 
+_REGISTERED_TOOL_NAMES = frozenset(schema["name"] for schema in TOOL_SCHEMAS)
+
 # ── Tool Executor ─────────────────────────────────────────────────────────────
 
-def execute_tool(name: str, tool_input: dict, harness: "ChatHarness") -> str:
+def execute_tool(
+    name: str,
+    tool_input: dict,
+    harness: "ChatHarness",
+    *,
+    authorized_tool_names: Set[str],
+) -> str:
     """
     执行 tool，返回给 Claude 的字符串结果。
     _PRINT_DIRECT 中的查询工具直接打印给用户，其余由 Claude 转述。
     """
+    if name not in _REGISTERED_TOOL_NAMES:
+        log.warning("[chat_tools] 拒绝未知 tool=%s", name)
+        return f"拒绝执行：未知 tool {name}。"
+    if name not in authorized_tool_names:
+        log.warning("[chat_tools] 拒绝未授权 tool=%s", name)
+        return f"拒绝执行：当前 Agent 未获授权使用 tool {name}。"
+
     try:
         _dispatch: dict = {
             "list_goals":               lambda: _tool_list_goals(tool_input),
@@ -305,8 +321,6 @@ def execute_tool(name: str, tool_input: dict, harness: "ChatHarness") -> str:
         if name not in _dispatch:
             return f"未知 tool: {name}"
         result = _dispatch[name]()
-        if name in _PRINT_DIRECT:
-            print(result)
         return result
     except Exception as e:
         log.error(f"[chat_tools] tool={name} 执行异常: {e}", exc_info=True)
@@ -477,13 +491,13 @@ def _tool_create_goal(inp: dict) -> str:
 
 def _tool_update_goal_preferences(inp: dict, harness: "ChatHarness") -> str:
     import goals as goals_mod
-    from main import _sanitize_preferences, _flatten_preference_keys
+    from engine.preferences import sanitize_preferences, flatten_preference_keys
 
     goal_id = inp.get("goal_id", "")
     if not goals_mod.get(goal_id):
         return f"未找到 goal: {goal_id}"
 
-    preferences = _sanitize_preferences(inp.get("preferences"))
+    preferences = sanitize_preferences(inp.get("preferences"))
     if not preferences:
         return "preferences 为空或格式不正确，key 只能是 content/delivery/behavior/format。"
 
@@ -494,19 +508,19 @@ def _tool_update_goal_preferences(inp: dict, harness: "ChatHarness") -> str:
             "preferences_updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         },
     )
-    pref_keys = _flatten_preference_keys(preferences)
+    pref_keys = flatten_preference_keys(preferences)
     return f"已更新 {goal_id} 的偏好：{', '.join(pref_keys)}"
 
 
 def _tool_update_loop_preferences(inp: dict, harness: "ChatHarness") -> str:
     from loops import discover
-    from main import _sanitize_preferences, _flatten_preference_keys
+    from engine.preferences import sanitize_preferences, flatten_preference_keys
 
     loop_name = inp.get("loop", "")
     if loop_name not in discover():
         return f"未找到 loop: {loop_name}"
 
-    preferences = _sanitize_preferences(inp.get("preferences"))
+    preferences = sanitize_preferences(inp.get("preferences"))
     if not preferences:
         return "preferences 为空或格式不正确。"
 
@@ -517,14 +531,14 @@ def _tool_update_loop_preferences(inp: dict, harness: "ChatHarness") -> str:
             "preferences_updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         },
     )
-    pref_keys = _flatten_preference_keys(preferences)
+    pref_keys = flatten_preference_keys(preferences)
     return f"已更新 {loop_name} 的默认偏好：{', '.join(pref_keys)}"
 
 
 def _tool_update_user_preferences(inp: dict, harness: "ChatHarness") -> str:
-    from main import _sanitize_preferences, _flatten_preference_keys
+    from engine.preferences import sanitize_preferences, flatten_preference_keys
 
-    preferences = _sanitize_preferences(inp.get("preferences"))
+    preferences = sanitize_preferences(inp.get("preferences"))
     goal_nicknames = inp.get("goal_nicknames")
 
     if not preferences and not goal_nicknames:
@@ -539,14 +553,14 @@ def _tool_update_user_preferences(inp: dict, harness: "ChatHarness") -> str:
     merged = harness.memory.merge_save_user_memory(updates)
     parts = []
     if preferences:
-        parts.append(f"偏好: {', '.join(_flatten_preference_keys(preferences))}")
+        parts.append(f"偏好: {', '.join(flatten_preference_keys(preferences))}")
     if goal_nicknames:
         parts.append(f"别名: {', '.join(f'{k}→{v}' for k, v in goal_nicknames.items())}")
     return f"已记住 {' | '.join(parts)}"
 
 
 def _tool_browser_open_url(inp: dict) -> str:
-    from engine.tools.browser.actions import open_url
+    from harness.agents.tools.browser.actions import open_url
     url = (inp.get("url") or "").strip()
 
     result = open_url(url)
@@ -557,7 +571,7 @@ def _tool_browser_open_url(inp: dict) -> str:
 
 
 def _tool_browser_observe(inp: dict) -> str:
-    from engine.tools.browser.actions import observe_active
+    from harness.agents.tools.browser.actions import observe_active
 
     result = observe_active()
     state = result.state
@@ -585,7 +599,7 @@ def _tool_browser_observe(inp: dict) -> str:
 
 
 def _tool_browser_click_text(inp: dict) -> str:
-    from engine.tools.browser.actions import click_text
+    from harness.agents.tools.browser.actions import click_text
 
     text = (inp.get("text") or "").strip()
     if not text:
@@ -598,7 +612,7 @@ def _tool_browser_click_text(inp: dict) -> str:
 
 
 def _tool_browser_type(inp: dict) -> str:
-    from engine.tools.browser.actions import type_text
+    from harness.agents.tools.browser.actions import type_text
 
     selector = (inp.get("selector") or "").strip()
     text = inp.get("text")
@@ -613,7 +627,7 @@ def _tool_browser_type(inp: dict) -> str:
 
 
 def _tool_browser_wait(inp: dict) -> str:
-    from engine.tools.browser.actions import wait_for
+    from harness.agents.tools.browser.actions import wait_for
 
     result = wait_for(
         timeout_ms=int(inp.get("timeout_ms") or 2_000),
@@ -625,6 +639,6 @@ def _tool_browser_wait(inp: dict) -> str:
 
 
 def _tool_browser_diagnostic(inp: dict) -> str:
-    from engine.tools.browser.diagnostics import render_browser_diagnostic, run_browser_diagnostic
+    from harness.agents.tools.browser.diagnostics import render_browser_diagnostic, run_browser_diagnostic
 
     return render_browser_diagnostic(run_browser_diagnostic(keep=bool(inp.get("keep", False))))

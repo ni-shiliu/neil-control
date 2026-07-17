@@ -121,8 +121,6 @@ class HarnessRunner:
             if state.stop_reason == "end_turn":
                 state.final_text = self._extract_text_response(response.content)
                 self._call_hook(self.hooks.on_end_turn, run_ctx, state)
-                if state.final_text:
-                    print(state.final_text)
                 return HarnessResult(
                     final_text=state.final_text,
                     tool_calls=list(state.tool_calls),
